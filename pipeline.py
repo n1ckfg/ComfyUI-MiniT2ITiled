@@ -696,44 +696,17 @@ class MiniT2IPipeline(DiffusionPipeline):
     def __call__(
         self,
         prompt: Union[str, List[str]],
-        transformer, text_encoder,
-        #model_type: str = "b16",
+        transformer, text_encoder, tokenizer,
         model_dir: Path,
-        repo_id_or_path: Union[str, os.PathLike] = "MiniT2I/MiniT2I",
-        torch_dtype: Optional[torch.dtype] = torch.bfloat16,
-        text_encoder_dtype: torch.dtype = torch.float32,
-        device: Optional[Union[str, torch.device]] = None,
-        local_files_only: bool = False,
-        revision: Optional[str] = None,
-        cache_dir: Optional[Union[str, os.PathLike]] = None,
         **kwargs,
     ):
-        if model_dir is None:
-            model_dir = self._resolve_model_type("b16")
-        root = self._resolve_root(repo_id_or_path, model_dir, revision, cache_dir, local_files_only)
-        model_root = root / model_dir
-        if transformer is None:
-            transformer = MiniT2IMMJiTModel.from_pretrained(model_root / "transformer", torch_dtype=torch_dtype)
-        scheduler = MiniT2IFlowMatchScheduler.from_pretrained(model_root / "scheduler")
-        text_encoder_name = transformer.mmjit_config.llm
-        tokenizer = AutoTokenizer.from_pretrained(text_encoder_name, local_files_only=local_files_only)
-
-        if text_encoder is None:
-            text_encoder = T5EncoderModel.from_pretrained(
-                text_encoder_name,
-                torch_dtype=text_encoder_dtype,
-                local_files_only=local_files_only,
-            )
         pipe = MiniT2ITextToImagePipeline(
             transformer=transformer,
-            scheduler=scheduler,
+            scheduler=MiniT2IFlowMatchScheduler.from_pretrained(model_dir / "scheduler"),
             tokenizer=tokenizer,
             text_encoder=text_encoder,
-            text_encoder_name=text_encoder_name,
+            text_encoder_name=transformer.mmjit_config.llm,
         )
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        pipe.to(device)
         return pipe(prompt=prompt, **kwargs)
 
 

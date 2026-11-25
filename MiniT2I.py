@@ -3,10 +3,15 @@ import torch
 from .pipeline import MiniT2IPipeline
 from comfy.model_patcher import ModelPatcher
 import comfy.model_management as mm
-from transformers import T5EncoderModel # AutoTokenizer, 
+from transformers import AutoTokenizer, T5EncoderModel
 
 
-model_downloaded = False
+class MiniT2IModule(torch.nn.Module):
+    # ModelPatcher assigns .device, which is a read-only property on transformers/diffusers models
+    def __init__(self, module, tokenizer=None):
+        super().__init__()
+        self.module = module
+        self.tokenizer = tokenizer
 
 
 class MiniT2ITextEncoder(io.ComfyNode):
@@ -25,16 +30,10 @@ class MiniT2ITextEncoder(io.ComfyNode):
 
     @classmethod
     def execute(cls) -> io.NodeOutput:
-        load_device = mm.get_torch_device()
-        offload_device = mm.intermediate_device()
+        text_encoder = T5EncoderModel.from_pretrained("google/flan-t5-large", torch_dtype=torch.float32)
+        tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-large")
 
-        text_encoder = T5EncoderModel.from_pretrained(
-             "google/flan-t5-large",
-             torch_dtype=torch.float32,
-             local_files_only=model_downloaded,
-         )
-
-        return io.NodeOutput(ModelPatcher(text_encoder, load_device, offload_device),)
+        return io.NodeOutput(ModelPatcher(MiniT2IModule(text_encoder, tokenizer), mm.text_encoder_device(), mm.text_encoder_offload_device()),)
 
 
 class MiniT2ILoader(io.ComfyNode):
@@ -55,10 +54,7 @@ class MiniT2ILoader(io.ComfyNode):
     @classmethod
     def execute(cls, model_type) -> io.NodeOutput:
         transformer = MiniT2IPipeline.load_transformer(model_type)
-        load_device = mm.get_torch_device()
-        offload_device = mm.intermediate_device()
-
-        return io.NodeOutput(ModelPatcher(transformer, load_device, offload_device),)
+        return io.NodeOutput(ModelPatcher(MiniT2IModule(transformer), mm.get_torch_device(), mm.unet_offload_device()),)
 
 
 class MiniT2ISampler(io.ComfyNode):
@@ -145,32 +141,16 @@ class MiniT2ISampler(io.ComfyNode):
 
     @classmethod
     def execute(cls, prompt, steps, guidance, model, text_encoder, seed) -> io.NodeOutput:
-        global model_downloaded
         torch.manual_seed(seed)
 
-        # transformer = model
-
-
-        HUB_MODEL_ID = "MiniT2I/MiniT2I"
-        pipe = MiniT2IPipeline.from_pretrained(
-#        pipe = DiffusionPipeline.from_pretrained(
-            HUB_MODEL_ID,
-#            custom_pipeline=str(script_dir / "pipeline.py"),
-            local_files_only=model_downloaded,
-#            trust_remote_code=True,
-        )
-        if pipe:
-            model_downloaded = True
-
-        output = pipe(
+        mm.load_models_gpu([model, text_encoder])
+        transformer = model.model.module
+        output = MiniT2IPipeline()(
             prompt,
-            model.model, text_encoder.model,
-#            model_type=model_type,
-            model_dir=model.model.config._name_or_path.parent if model else None,
+            transformer, text_encoder.model.module, text_encoder.model.tokenizer,
+            model_dir=transformer.config._name_or_path.parent,
             guidance_scale=guidance,
             num_inference_steps=steps,
-            torch_dtype=torch.bfloat16,
-            local_files_only=model_downloaded,
             output_type="pt",
         )
  
