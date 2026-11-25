@@ -353,16 +353,18 @@ class DiffusionModel(nn.Module):
             total[y:y + size, x:x + size] += window
         return [(y, x, (window / total[y:y + size, x:x + size]).to(dtype)) for y, x in tiles]
 
-    def tiled_cfg_velocity(self, x, t, text, mask, cfg_scale, tiles):
+    def tiled_cfg_velocity(self, x, t, text, mask, cfg_scale, tiles, tile_callback=None):
         size = self.cfg.image_size
         v = torch.zeros_like(x)
         for y, x0, weight in tiles:
             tile_v = self.cfg_velocity(x[:, :, y:y + size, x0:x0 + size], t, text, mask, cfg_scale)
             v[:, :, y:y + size, x0:x0 + size].addcmul_(tile_v, weight)
+            if tile_callback is not None:
+                tile_callback()
         return v
 
     @torch.no_grad()
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64):
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None):
         b = text.shape[0]
         device = text.device
         dtype = next(self.parameters()).dtype
@@ -373,6 +375,15 @@ class DiffusionModel(nn.Module):
         if image is not None:
             x = torch.lerp(x, image, t_start)
         tiles = self.tile_weights(height, width, tile_overlap, device, dtype)
+        tile_callback = None
+        if callback is not None:
+            total = self.cfg.n_T * len(tiles)
+            done = 0
+
+            def tile_callback():
+                nonlocal done
+                done += 1
+                callback(done, total)
         timesteps = torch.linspace(t_start, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
         iterator = range(self.cfg.n_T)
         if progress:
@@ -381,7 +392,7 @@ class DiffusionModel(nn.Module):
         for i in iterator:
             t_cur = timesteps[i].expand(b)
             t_next = timesteps[i + 1].expand(b)
-            v = self.tiled_cfg_velocity(x, t_cur, text.to(dtype), mask.to(dtype), cfg_scale, tiles)
+            v = self.tiled_cfg_velocity(x, t_cur, text.to(dtype), mask.to(dtype), cfg_scale, tiles, tile_callback)
             x = x + (t_next - t_cur)[:, None, None, None] * v
         return x
 
@@ -498,8 +509,8 @@ class MiniT2IMMJiTModel(ModelMixin, ConfigMixin):
     def pred_velocity(self, x, t, text, mask):
         return self.model.pred_velocity(x, t, text, mask)
 
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64):
-        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap)
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None):
+        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap, callback=callback)
 
 
 class MiniT2ITextToImagePipeline(nn.Module):
@@ -619,6 +630,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
         image: Optional[torch.Tensor] = None,
         denoise: float = 1.0,
         tile_overlap: int = 64,
+        callback=None,
     ):
         device = next(self.transformer.parameters()).device
         if isinstance(prompt, str):
@@ -642,6 +654,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
                 image=image,
                 denoise=denoise,
                 tile_overlap=tile_overlap,
+                callback=callback,
             )
         finally:
             self.transformer.model.cfg.n_T = old_steps

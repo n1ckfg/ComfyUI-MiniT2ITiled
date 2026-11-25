@@ -159,6 +159,13 @@ class MiniT2ISampler(io.ComfyNode):
                 image = comfy.utils.common_upscale(image, max(size, round(width * scale)), max(size, round(height * scale)), "bilinear", "disabled")
             image = (image * 2 - 1).to(transformer.device, transformer.dtype)
             num_images = image.shape[0]
+
+        pbar = comfy.utils.ProgressBar(steps)
+
+        def callback(done, total):
+            mm.throw_exception_if_processing_interrupted()
+            pbar.update_absolute(done, total)
+
         output = MiniT2IPipeline()(
             prompt,
             transformer, text_encoder.model.module, text_encoder.model.tokenizer,
@@ -169,6 +176,7 @@ class MiniT2ISampler(io.ComfyNode):
             image=image,
             denoise=denoise,
             tile_overlap=tile_overlap,
+            callback=callback,
             output_type="pt",
         )
  
