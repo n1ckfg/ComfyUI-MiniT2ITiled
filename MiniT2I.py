@@ -3,6 +3,7 @@ import torch
 from .pipeline import MiniT2IPipeline
 from comfy.model_patcher import ModelPatcher
 import comfy.model_management as mm
+import comfy.utils
 from transformers import AutoTokenizer, T5EncoderModel
 
 
@@ -110,9 +111,11 @@ class MiniT2ISampler(io.ComfyNode):
                 io.Int.Input(
                     "seed",
                     default=1,
-                    step=1, 
+                    step=1,
                     lazy=True,  # Will only be evaluated if check_lazy_status requires it
                 ),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used with an image. Lower keeps more of the input image."),
+                io.Image.Input("image", optional=True, tooltip="Input image for image to image. Resized to the model's 512x512."),
             ],
             outputs=[
                 io.Image.Output(),
@@ -140,17 +143,28 @@ class MiniT2ISampler(io.ComfyNode):
 
 
     @classmethod
-    def execute(cls, prompt, steps, guidance, model, text_encoder, seed) -> io.NodeOutput:
+    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, image=None) -> io.NodeOutput:
         torch.manual_seed(seed)
 
         mm.load_models_gpu([model, text_encoder])
         transformer = model.model.module
+        num_images = 1
+        if image is not None:
+            size = transformer.mmjit_config.image_size
+            image = image[..., :3].movedim(-1, 1)
+            if image.shape[-2:] != (size, size):
+                image = comfy.utils.common_upscale(image, size, size, "bilinear", "center")
+            image = (image * 2 - 1).to(transformer.device, transformer.dtype)
+            num_images = image.shape[0]
         output = MiniT2IPipeline()(
             prompt,
             transformer, text_encoder.model.module, text_encoder.model.tokenizer,
             model_dir=transformer.config._name_or_path.parent,
             guidance_scale=guidance,
             num_inference_steps=steps,
+            num_images_per_prompt=num_images,
+            image=image,
+            denoise=denoise,
             output_type="pt",
         )
  

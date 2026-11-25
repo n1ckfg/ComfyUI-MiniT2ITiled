@@ -336,7 +336,7 @@ class DiffusionModel(nn.Module):
         return uncond + (cond - uncond) * scale
 
     @torch.no_grad()
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False):
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0):
         b = text.shape[0]
         device = text.device
         dtype = next(self.parameters()).dtype
@@ -344,7 +344,10 @@ class DiffusionModel(nn.Module):
             b, self.cfg.in_channels, self.cfg.image_size, self.cfg.image_size,
             generator=generator, device=device, dtype=dtype,
         ) * 2
-        timesteps = torch.linspace(0.0, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
+        t_start = 1.0 - denoise
+        if image is not None:
+            x = torch.lerp(x, image, t_start)
+        timesteps = torch.linspace(t_start, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
         iterator = range(self.cfg.n_T)
         if progress:
             from tqdm.auto import tqdm
@@ -469,8 +472,8 @@ class MiniT2IMMJiTModel(ModelMixin, ConfigMixin):
     def pred_velocity(self, x, t, text, mask):
         return self.model.pred_velocity(x, t, text, mask)
 
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False):
-        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress)
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0):
+        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise)
 
 
 class MiniT2ITextToImagePipeline(nn.Module):
@@ -587,6 +590,8 @@ class MiniT2ITextToImagePipeline(nn.Module):
         output_type: str = "pil",
         return_dict: bool = True,
         progress: bool = True,
+        image: Optional[torch.Tensor] = None,
+        denoise: float = 1.0,
     ):
         device = next(self.transformer.parameters()).device
         if isinstance(prompt, str):
@@ -607,6 +612,8 @@ class MiniT2ITextToImagePipeline(nn.Module):
                 cfg_scale=guidance_scale,
                 generator=generator,
                 progress=progress,
+                image=image,
+                denoise=denoise,
             )
         finally:
             self.transformer.model.cfg.n_T = old_steps
