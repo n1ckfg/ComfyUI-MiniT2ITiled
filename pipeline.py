@@ -310,6 +310,13 @@ class MMJiT(nn.Module):
         return self.unpatchify(img_out)
 
 
+def tile_starts(length, size, overlap):
+    if length <= size:
+        return [0]
+    n = math.ceil((length - size) / (size - overlap)) + 1
+    return [(length - size) * i // (n - 1) for i in range(n)]
+
+
 class DiffusionModel(nn.Module):
     def __init__(self, cfg: Optional[MMJiTConfig] = None):
         super().__init__()
@@ -335,18 +342,37 @@ class DiffusionModel(nn.Module):
         scale = torch.where(use_cfg[:, None, None, None] > 0, torch.tensor(cfg_scale, device=x.device, dtype=out.dtype), torch.tensor(1.0, device=x.device, dtype=out.dtype))
         return uncond + (cond - uncond) * scale
 
+    def tile_weights(self, height, width, overlap, device, dtype):
+        size = self.cfg.image_size
+        ramp = torch.arange(size, device=device, dtype=torch.float32)
+        ramp = torch.minimum(ramp + 1, size - ramp).clamp(max=overlap + 1) / (overlap + 1)
+        window = ramp[:, None] * ramp[None, :]
+        tiles = [(y, x) for y in tile_starts(height, size, overlap) for x in tile_starts(width, size, overlap)]
+        total = torch.zeros(height, width, device=device, dtype=torch.float32)
+        for y, x in tiles:
+            total[y:y + size, x:x + size] += window
+        return [(y, x, (window / total[y:y + size, x:x + size]).to(dtype)) for y, x in tiles]
+
+    def tiled_cfg_velocity(self, x, t, text, mask, cfg_scale, tiles):
+        size = self.cfg.image_size
+        v = torch.zeros_like(x)
+        for y, x0, weight in tiles:
+            tile_v = self.cfg_velocity(x[:, :, y:y + size, x0:x0 + size], t, text, mask, cfg_scale)
+            v[:, :, y:y + size, x0:x0 + size].addcmul_(tile_v, weight)
+        return v
+
     @torch.no_grad()
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0):
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64):
         b = text.shape[0]
         device = text.device
         dtype = next(self.parameters()).dtype
-        x = torch.randn(
-            b, self.cfg.in_channels, self.cfg.image_size, self.cfg.image_size,
-            generator=generator, device=device, dtype=dtype,
-        ) * 2
+        size = self.cfg.image_size
+        height, width = image.shape[-2:] if image is not None else (size, size)
+        x = torch.randn(b, self.cfg.in_channels, height, width, generator=generator, device=device, dtype=dtype) * 2
         t_start = 1.0 - denoise
         if image is not None:
             x = torch.lerp(x, image, t_start)
+        tiles = self.tile_weights(height, width, tile_overlap, device, dtype)
         timesteps = torch.linspace(t_start, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
         iterator = range(self.cfg.n_T)
         if progress:
@@ -355,7 +381,7 @@ class DiffusionModel(nn.Module):
         for i in iterator:
             t_cur = timesteps[i].expand(b)
             t_next = timesteps[i + 1].expand(b)
-            v = self.cfg_velocity(x, t_cur, text.to(dtype), mask.to(dtype), cfg_scale)
+            v = self.tiled_cfg_velocity(x, t_cur, text.to(dtype), mask.to(dtype), cfg_scale, tiles)
             x = x + (t_next - t_cur)[:, None, None, None] * v
         return x
 
@@ -472,8 +498,8 @@ class MiniT2IMMJiTModel(ModelMixin, ConfigMixin):
     def pred_velocity(self, x, t, text, mask):
         return self.model.pred_velocity(x, t, text, mask)
 
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0):
-        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise)
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64):
+        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap)
 
 
 class MiniT2ITextToImagePipeline(nn.Module):
@@ -592,6 +618,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
         progress: bool = True,
         image: Optional[torch.Tensor] = None,
         denoise: float = 1.0,
+        tile_overlap: int = 64,
     ):
         device = next(self.transformer.parameters()).device
         if isinstance(prompt, str):
@@ -614,6 +641,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
                 progress=progress,
                 image=image,
                 denoise=denoise,
+                tile_overlap=tile_overlap,
             )
         finally:
             self.transformer.model.cfg.n_T = old_steps

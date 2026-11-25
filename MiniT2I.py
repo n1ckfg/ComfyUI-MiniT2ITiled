@@ -115,7 +115,8 @@ class MiniT2ISampler(io.ComfyNode):
                     lazy=True,  # Will only be evaluated if check_lazy_status requires it
                 ),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used with an image. Lower keeps more of the input image."),
-                io.Image.Input("image", optional=True, tooltip="Input image for image to image. Resized to the model's 512x512."),
+                io.Image.Input("image", optional=True, tooltip="Input image for image to image. Images larger than 512x512 are sampled in overlapping 512x512 tiles at their own size."),
+                io.Int.Input("tile_overlap", default=64, min=0, max=256, step=8, tooltip="Overlap in pixels between 512x512 tiles when the image is larger than 512x512."),
             ],
             outputs=[
                 io.Image.Output(),
@@ -143,7 +144,7 @@ class MiniT2ISampler(io.ComfyNode):
 
 
     @classmethod
-    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, image=None) -> io.NodeOutput:
+    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, image=None) -> io.NodeOutput:
         torch.manual_seed(seed)
 
         mm.load_models_gpu([model, text_encoder])
@@ -152,8 +153,10 @@ class MiniT2ISampler(io.ComfyNode):
         if image is not None:
             size = transformer.mmjit_config.image_size
             image = image[..., :3].movedim(-1, 1)
-            if image.shape[-2:] != (size, size):
-                image = comfy.utils.common_upscale(image, size, size, "bilinear", "center")
+            height, width = image.shape[-2:]
+            if min(height, width) < size:
+                scale = size / min(height, width)
+                image = comfy.utils.common_upscale(image, max(size, round(width * scale)), max(size, round(height * scale)), "bilinear", "disabled")
             image = (image * 2 - 1).to(transformer.device, transformer.dtype)
             num_images = image.shape[0]
         output = MiniT2IPipeline()(
@@ -165,6 +168,7 @@ class MiniT2ISampler(io.ComfyNode):
             num_images_per_prompt=num_images,
             image=image,
             denoise=denoise,
+            tile_overlap=tile_overlap,
             output_type="pt",
         )
  
