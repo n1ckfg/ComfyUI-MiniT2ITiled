@@ -76,6 +76,18 @@ class SwiGLUMlp(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+_TEXT_ROPE_CACHE = {}
+_VISION_ROPE_CACHE = {}
+_POS_EMBED_CACHE = {}
+_SCHEDULER_CACHE = {}
+
+
+def _cache_put(cache: dict, key, value, max_size: int = 64):
+    if len(cache) >= max_size:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
 class TextRotaryEmbedding1D(nn.Module):
     def __init__(self, head_dim: int, theta: float = 10000.0):
         super().__init__()
@@ -83,14 +95,21 @@ class TextRotaryEmbedding1D(nn.Module):
         self.theta = theta
 
     def forward(self, x):
-        b, length, h, d = x.shape
-        inv = 1.0 / (self.theta ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
-        pos = torch.arange(length, device=x.device, dtype=torch.float32)
-        angles = torch.einsum("l,f->lf", pos, inv)
-        angles = torch.cat([angles, angles], dim=-1)
-        cos = angles.cos().to(dtype=x.dtype)
-        sin = angles.sin().to(dtype=x.dtype)
-        return x * cos[None, :, None, :] + rotate_half(x) * sin[None, :, None, :]
+        _, length, _, d = x.shape
+        key = (length, d, self.theta, x.device, x.dtype)
+        cached = _TEXT_ROPE_CACHE.get(key)
+        if cached is None:
+            with torch.inference_mode(False), torch.no_grad():
+                inv = 1.0 / (self.theta ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
+                pos = torch.arange(length, device=x.device, dtype=torch.float32)
+                angles = torch.einsum("l,f->lf", pos, inv)
+                angles = torch.cat([angles, angles], dim=-1)
+                cos = angles.cos().to(dtype=x.dtype)[None, :, None, :]
+                sin = angles.sin().to(dtype=x.dtype)[None, :, None, :]
+                cached = (cos, sin)
+                _cache_put(_TEXT_ROPE_CACHE, key, cached)
+        cos, sin = cached
+        return x * cos + rotate_half(x) * sin
 
 
 class VisionRotaryEmbeddingFast(nn.Module):
@@ -101,21 +120,28 @@ class VisionRotaryEmbeddingFast(nn.Module):
 
     def forward(self, x):
         length = x.shape[1]
-        side = int(math.sqrt(length))
-        if side * side != length:
-            raise ValueError(f"image token length must be square, got {length}")
-        freqs = 1.0 / (
-            self.theta
-            ** (torch.arange(0, self.dim, 2, device=x.device, dtype=torch.float32)[: self.dim // 2] / self.dim)
-        )
-        t = torch.arange(side, device=x.device, dtype=torch.float32)
-        base = torch.einsum("l,f->lf", t, freqs)
-        f_h, f_w = torch.broadcast_tensors(base[:, None, :], base[None, :, :])
-        angles = torch.cat([f_h, f_w], dim=-1)
-        angles = torch.cat([angles, angles], dim=-1).reshape(length, -1)
-        cos = angles.cos().to(dtype=x.dtype)
-        sin = angles.sin().to(dtype=x.dtype)
-        return x * cos[None, :, None, :] + rotate_half(x) * sin[None, :, None, :]
+        key = (length, self.dim, self.theta, x.device, x.dtype)
+        cached = _VISION_ROPE_CACHE.get(key)
+        if cached is None:
+            side = int(math.sqrt(length))
+            if side * side != length:
+                raise ValueError(f"image token length must be square, got {length}")
+            with torch.inference_mode(False), torch.no_grad():
+                freqs = 1.0 / (
+                    self.theta
+                    ** (torch.arange(0, self.dim, 2, device=x.device, dtype=torch.float32)[: self.dim // 2] / self.dim)
+                )
+                t = torch.arange(side, device=x.device, dtype=torch.float32)
+                base = torch.einsum("l,f->lf", t, freqs)
+                f_h, f_w = torch.broadcast_tensors(base[:, None, :], base[None, :, :])
+                angles = torch.cat([f_h, f_w], dim=-1)
+                angles = torch.cat([angles, angles], dim=-1).reshape(length, -1)
+                cos = angles.cos().to(dtype=x.dtype)[None, :, None, :]
+                sin = angles.sin().to(dtype=x.dtype)[None, :, None, :]
+                cached = (cos, sin)
+                _cache_put(_VISION_ROPE_CACHE, key, cached)
+        cos, sin = cached
+        return x * cos + rotate_half(x) * sin
 
 
 class MultiModalRotaryEmbeddingFast(nn.Module):
@@ -149,10 +175,10 @@ class PlainTextTransformerBlock(nn.Module):
         b, length, _ = txt.shape
         qkv = self.qkv(self.norm1(txt)).reshape(b, length, 3, self.num_heads, self.head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
-        q = self.rope(self.q_norm(q))
-        k = self.rope(self.k_norm(k))
-        attn = torch.einsum("bqhd,bkhd->bhqk", q, k) * (self.head_dim ** -0.5)
-        out = torch.einsum("bhqk,bkhd->bqhd", attn.softmax(dim=-1), v).reshape(b, length, -1)
+        q = self.rope(self.q_norm(q)).transpose(1, 2)
+        k = self.rope(self.k_norm(k)).transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(b, length, -1)
         txt = txt + self.attn_proj(out)
         txt = txt + self.mlp(self.norm2(txt))
         return txt
@@ -191,11 +217,10 @@ class DoubleStreamDiTBlock(nn.Module):
         q_t, k_t, v_t = qkv_t[:, :, 0], qkv_t[:, :, 1], qkv_t[:, :, 2]
         q_i, k_i = self.q_norm(q_i), self.k_norm(k_i)
         q_t, k_t = self.q_norm(q_t), self.k_norm(k_t)
-        q = self.rope(torch.cat([q_t, q_i], dim=1), txt_len=lt)
-        k = self.rope(torch.cat([k_t, k_i], dim=1), txt_len=lt)
-        v = torch.cat([v_t, v_i], dim=1)
-        attn = torch.einsum("bqhd,bkhd->bhqk", q, k) * (self.head_dim ** -0.5)
-        out = torch.einsum("bhqk,bkhd->bqhd", attn.softmax(dim=-1), v)
+        q = self.rope(torch.cat([q_t, q_i], dim=1), txt_len=lt).transpose(1, 2)
+        k = self.rope(torch.cat([k_t, k_i], dim=1), txt_len=lt).transpose(1, 2)
+        v = torch.cat([v_t, v_i], dim=1).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v).transpose(1, 2)
         x = x + self.img_attn_proj(out[:, lt:].reshape(b, li, -1))
         txt = txt + self.txt_attn_proj(out[:, :lt].reshape(b, lt, -1))
         x = x + self.img_mlp(self.img_norm2(x))
@@ -216,13 +241,19 @@ class FinalLayer(nn.Module):
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, device, dtype):
-    grid_h = torch.arange(grid_size, device=device, dtype=torch.float32)
-    grid_w = torch.arange(grid_size, device=device, dtype=torch.float32)
-    grid = torch.meshgrid(grid_w, grid_h, indexing="xy")
-    grid = torch.stack(grid, dim=0).reshape(2, 1, grid_size, grid_size)
-    emb_h = get_1d_sincos_pos_embed(embed_dim // 2, grid[0])
-    emb_w = get_1d_sincos_pos_embed(embed_dim // 2, grid[1])
-    return torch.cat([emb_h, emb_w], dim=1).to(dtype=dtype)
+    key = (embed_dim, grid_size, device, dtype)
+    cached = _POS_EMBED_CACHE.get(key)
+    if cached is None:
+        with torch.inference_mode(False), torch.no_grad():
+            grid_h = torch.arange(grid_size, device=device, dtype=torch.float32)
+            grid_w = torch.arange(grid_size, device=device, dtype=torch.float32)
+            grid = torch.meshgrid(grid_w, grid_h, indexing="xy")
+            grid = torch.stack(grid, dim=0).reshape(2, 1, grid_size, grid_size)
+            emb_h = get_1d_sincos_pos_embed(embed_dim // 2, grid[0])
+            emb_w = get_1d_sincos_pos_embed(embed_dim // 2, grid[1])
+            cached = torch.cat([emb_h, emb_w], dim=1).to(dtype=dtype)
+            _cache_put(_POS_EMBED_CACHE, key, cached)
+    return cached
 
 
 def get_1d_sincos_pos_embed(embed_dim, pos):
@@ -332,17 +363,30 @@ class DiffusionModel(nn.Module):
         x0 = self.net(x, self.real_t_to_embed_t(t), text, mask)
         return (x0 - x) / torch.clamp(1 - t[:, None, None, None], min=0.001)
 
-    def cfg_velocity(self, x, t, text, mask, cfg_scale: float):
+    def _cfg_velocity_and_x0(self, x, t, text, mask, cfg_scale: float):
         b = x.shape[0]
+        use_cfg = (t >= self.cfg.cfg_interval[0]) & (t <= self.cfg.cfg_interval[1])
+        if cfg_scale == 1.0 or not bool(use_cfg.any()):
+            x0_cond = self.net(x, self.real_t_to_embed_t(t), text, mask)
+            v = (x0_cond - x) / torch.clamp(1 - t[:, None, None, None], min=0.001)
+            return v, x0_cond
         xx = torch.cat([x, x], dim=0)
         tt = torch.cat([t, t], dim=0)
         yy = torch.cat([text, text], dim=0)
         mm = torch.cat([mask, torch.zeros_like(mask)], dim=0)
-        out = self.pred_velocity(xx, tt, yy, mm)
+        x0_all = self.net(xx, self.real_t_to_embed_t(tt), yy, mm)
+        out = (x0_all - xx) / torch.clamp(1 - tt[:, None, None, None], min=0.001)
         cond, uncond = out[:b], out[b:]
-        use_cfg = ((t >= self.cfg.cfg_interval[0]) & (t <= self.cfg.cfg_interval[1])).to(out.dtype)
-        scale = torch.where(use_cfg[:, None, None, None] > 0, torch.tensor(cfg_scale, device=x.device, dtype=out.dtype), torch.tensor(1.0, device=x.device, dtype=out.dtype))
-        return uncond + (cond - uncond) * scale
+        if bool(use_cfg.all()):
+            v = uncond + (cond - uncond) * cfg_scale
+        else:
+            scale = torch.where(use_cfg[:, None, None, None], cfg_scale, 1.0).to(out.dtype)
+            v = uncond + (cond - uncond) * scale
+        return v, x0_all[:b]
+
+    def cfg_velocity(self, x, t, text, mask, cfg_scale: float):
+        v, _ = self._cfg_velocity_and_x0(x, t, text, mask, cfg_scale)
+        return v
 
     def tile_weights(self, height, width, overlap, device, dtype):
         size = self.cfg.image_size
@@ -355,14 +399,19 @@ class DiffusionModel(nn.Module):
             total[y:y + size, x:x + size] += window
         return [(y, x, (window / total[y:y + size, x:x + size]).to(dtype)) for y, x in tiles]
 
-    def tiled_cfg_velocity(self, x, t, text, mask, cfg_scale, tiles, tile_callback=None):
+    def tiled_cfg_velocity(self, x, t, text, mask, cfg_scale, tiles, tile_callback=None, return_x0=False):
         size = self.cfg.image_size
         v = torch.zeros_like(x)
+        x0_cond = torch.zeros_like(x) if return_x0 else None
         for y, x0, weight in tiles:
-            tile_v = self.cfg_velocity(x[:, :, y:y + size, x0:x0 + size], t, text, mask, cfg_scale)
+            tile_v, tile_x0 = self._cfg_velocity_and_x0(x[:, :, y:y + size, x0:x0 + size], t, text, mask, cfg_scale)
             v[:, :, y:y + size, x0:x0 + size].addcmul_(tile_v, weight)
+            if return_x0:
+                x0_cond[:, :, y:y + size, x0:x0 + size].addcmul_(tile_x0, weight)
             if tile_callback is not None:
                 tile_callback()
+        if return_x0:
+            return v, x0_cond
         return v
 
     def tiled_cond_x0(self, x, t, text, mask, tiles):
@@ -410,6 +459,8 @@ class DiffusionModel(nn.Module):
             # so guidance backpropagates through a clone that lives only for this call.
             with torch.inference_mode(False):
                 params = {k: p.clone() for k, p in itertools.chain(self.net.named_parameters(), self.net.named_buffers())}
+        text_dtype = text.to(dtype)
+        mask_dtype = mask.to(dtype)
         timesteps = torch.linspace(t_start, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
         iterator = range(self.cfg.n_T)
         if progress:
@@ -418,13 +469,15 @@ class DiffusionModel(nn.Module):
         for i in iterator:
             t_cur = timesteps[i].expand(b)
             t_next = timesteps[i + 1].expand(b)
-            v = self.tiled_cfg_velocity(x, t_cur, text.to(dtype), mask.to(dtype), cfg_scale, tiles, tile_callback)
             t_float = t_start + (1.0 - t_start) * i / self.cfg.n_T
-            if guide is not None and guide.active(t_float):
+            need_guide = guide is not None and guide.active(t_float)
+            if need_guide:
+                v, x0_cond = self.tiled_cfg_velocity(x, t_cur, text_dtype, mask_dtype, cfg_scale, tiles, tile_callback, return_x0=True)
                 remaining = torch.clamp(1 - t_cur, min=0.001)[:, None, None, None]
-                x0_cond = self.tiled_cond_x0(x, t_cur, text.to(dtype), mask.to(dtype), tiles)
-                vjp = lambda grad_x0: self.tiled_x0_vjp(params, x, t_cur, text.to(dtype), mask.to(dtype), tiles, grad_x0)
+                vjp = lambda grad_x0: self.tiled_x0_vjp(params, x, t_cur, text_dtype, mask_dtype, tiles, grad_x0)
                 v = v - guide.correction(x0_cond, t_float, vjp) / remaining
+            else:
+                v = self.tiled_cfg_velocity(x, t_cur, text_dtype, mask_dtype, cfg_scale, tiles, tile_callback)
             x = x + (t_next - t_cur)[:, None, None, None] * v
         return x
 
@@ -664,6 +717,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
         tile_overlap: int = 64,
         callback=None,
         guide=None,
+        prompt_embeds: Optional[tuple] = None,
     ):
         device = next(self.transformer.parameters()).device
         if isinstance(prompt, str):
@@ -676,7 +730,12 @@ class MiniT2ITextToImagePipeline(nn.Module):
         old_steps = self.transformer.mmjit_config.n_T
         self.transformer.model.cfg.n_T = int(num_inference_steps or self.scheduler.config.num_inference_steps)
         try:
-            text, attn = self._encode_prompt(prompt_batch, device)
+            if prompt_embeds is not None:
+                text, attn = prompt_embeds
+                text = text.to(device)
+                attn = attn.to(device)
+            else:
+                text, attn = self._encode_prompt(prompt_batch, device)
             model_dtype = next(self.transformer.parameters()).dtype
             images = self.transformer.sample(
                 text.to(dtype=model_dtype),
@@ -747,16 +806,30 @@ class MiniT2IPipeline(DiffusionPipeline):
         root = Path(repo_id_or_path)
         if root.exists():
             return root
+        allow_patterns = [
+            f"{model_dir}/transformer/*",
+            f"{model_dir}/scheduler/*",
+        ]
+        if not local_files_only:
+            try:
+                return Path(
+                    snapshot_download(
+                        repo_id=str(repo_id_or_path),
+                        revision=revision,
+                        cache_dir=cache_dir,
+                        local_files_only=True,
+                        allow_patterns=allow_patterns,
+                    )
+                )
+            except OSError:
+                pass
         return Path(
             snapshot_download(
                 repo_id=str(repo_id_or_path),
                 revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=local_files_only,
-                allow_patterns=[
-                    f"{model_dir}/transformer/*",
-                    f"{model_dir}/scheduler/*",
-                ],
+                allow_patterns=allow_patterns,
             )
         )
 
@@ -772,7 +845,9 @@ class MiniT2IPipeline(DiffusionPipeline):
         model_dir = cls._resolve_model_type(model_type)
         root = cls._resolve_root(repo_id_or_path, model_dir, revision, cache_dir, local_files_only)
         model_root = root / model_dir
-        return MiniT2IMMJiTModel.from_pretrained(model_root / "transformer", torch_dtype=torch_dtype)
+        transformer = MiniT2IMMJiTModel.from_pretrained(model_root / "transformer", torch_dtype=torch_dtype)
+        transformer.eval()
+        return transformer
 
     @torch.no_grad()
     def __call__(
@@ -782,9 +857,14 @@ class MiniT2IPipeline(DiffusionPipeline):
         model_dir: Path,
         **kwargs,
     ):
+        scheduler_dir = model_dir / "scheduler"
+        scheduler = _SCHEDULER_CACHE.get(scheduler_dir)
+        if scheduler is None:
+            scheduler = MiniT2IFlowMatchScheduler.from_pretrained(scheduler_dir)
+            _SCHEDULER_CACHE[scheduler_dir] = scheduler
         pipe = MiniT2ITextToImagePipeline(
             transformer=transformer,
-            scheduler=MiniT2IFlowMatchScheduler.from_pretrained(model_dir / "scheduler"),
+            scheduler=scheduler,
             tokenizer=tokenizer,
             text_encoder=text_encoder,
             text_encoder_name=transformer.mmjit_config.llm,

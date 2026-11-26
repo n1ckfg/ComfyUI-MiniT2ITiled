@@ -186,9 +186,12 @@ Control is training-free gradient guidance on the model's $x_0$ prediction; ther
   - `_encode_prompt` moves the text encoder to the transformer's device if they differ, outside `ModelPatcher`'s control.
 - **Optional Inputs in `MiniT2ISampler`:** `model` and `text_encoder` are declared `optional=True`, yet `execute()` dereferences both. Both loader nodes must be connected.
 - **`denoise` without an image:** the tooltip says it is only used with an image, but `sample` always starts at `t = 1 - denoise`. Values below 1 without an image start mid-schedule from pure noise.
+- **Attention & Caching:**
+  - `PlainTextTransformerBlock` and `DoubleStreamDiTBlock` use `torch.nn.functional.scaled_dot_product_attention` (SDPA) instead of materialized `einsum` + `softmax`.
+  - 2D sinusoidal positional embeddings and 1D/2D RoPE `cos`/`sin` tables are cached in memory (created outside `inference_mode` so autograd in `tiled_x0_vjp` works cleanly).
+  - Loaded `ModelPatcher` instances for the transformer, text encoder, and Depth Anything 3 model, as well as the `MiniT2IFlowMatchScheduler` and the last 16 prompt embeddings, are cached in memory. On a prompt cache hit, the T5 text encoder does not need to be loaded onto GPU.
 - **Cost per step:**
-  - Each step runs one batch-of-2 CFG pass per tile.
-  - Guided steps add one conditional forward pass plus one VJP (forward + backward) per tile, plus the control losses (a Depth Anything 3 forward/backward for depth and normal).
-- **Per-Run Overhead:** `MiniT2ISampler.execute` builds a new `MiniT2IPipeline` and reloads the scheduler config on each call. The transformer, text encoder and tokenizer come cached from the loader nodes.
-- **Hub access:** `MiniT2ILoader` calls `snapshot_download` and `MiniT2ITextEncoder` calls `from_pretrained("google/flan-t5-large")` without `local_files_only`. Each loader execution checks the Hugging Face Hub when online.
+  - Each step runs one batch-of-2 CFG pass per tile (or a single conditional pass when `guidance == 1.0` or outside `cfg_interval`).
+  - Guided steps reuse the conditional $x_0$ from the CFG pass and add one VJP (forward + backward) per tile, plus the control losses (a Depth Anything 3 forward/backward for depth and normal).
+- **Hub access:** `MiniT2ILoader` and `MiniT2ITextEncoder` try `local_files_only=True` first and only hit the Hugging Face Hub if the weights are not cached locally.
 - **Conditioning Vector (`vec`):** `MMJiT.forward` computes `vec = t_vec + pooled_embedder(pooled_text)` and passes it to `DoubleStreamDiTBlock` and `FinalLayer`, which accept it without applying AdaLN modulation. `modulate()` is defined but unused.

@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from comfy_api.latest import io
 import torch
 from .pipeline import MiniT2IPipeline
@@ -13,6 +14,20 @@ from transformers import AutoTokenizer, T5EncoderModel
 MiniT2IControlType = io.Custom("MINIT2I_CONTROL")
 # Estimates depth of the image being generated so depth and normal controls can compare it with the control map.
 DEPTH_ESTIMATOR = "depth_anything_3_small.safetensors"
+
+_TEXT_ENCODER_CACHE = None
+_TRANSFORMER_CACHE = {}
+_DEPTH_MODEL_CACHE = {}
+_PROMPT_CACHE = OrderedDict()
+_PROMPT_CACHE_MAX = 16
+_PIPELINE = MiniT2IPipeline()
+
+
+def _load_pretrained_local_first(loader_cls, repo_id, **kwargs):
+    try:
+        return loader_cls.from_pretrained(repo_id, local_files_only=True, **kwargs)
+    except OSError:
+        return loader_cls.from_pretrained(repo_id, **kwargs)
 
 
 class MiniT2IModule(torch.nn.Module):
@@ -39,10 +54,18 @@ class MiniT2ITextEncoder(io.ComfyNode):
 
     @classmethod
     def execute(cls) -> io.NodeOutput:
-        text_encoder = T5EncoderModel.from_pretrained("google/flan-t5-large", torch_dtype=torch.float32)
-        tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-large")
+        global _TEXT_ENCODER_CACHE
+        if _TEXT_ENCODER_CACHE is None:
+            text_encoder = _load_pretrained_local_first(T5EncoderModel, "google/flan-t5-large", torch_dtype=torch.float32)
+            text_encoder.eval()
+            tokenizer = _load_pretrained_local_first(AutoTokenizer, "google/flan-t5-large")
+            _TEXT_ENCODER_CACHE = ModelPatcher(
+                MiniT2IModule(text_encoder, tokenizer),
+                mm.text_encoder_device(),
+                mm.text_encoder_offload_device(),
+            )
 
-        return io.NodeOutput(ModelPatcher(MiniT2IModule(text_encoder, tokenizer), mm.text_encoder_device(), mm.text_encoder_offload_device()),)
+        return io.NodeOutput(_TEXT_ENCODER_CACHE.clone(),)
 
 
 class MiniT2ILoader(io.ComfyNode):
@@ -62,8 +85,12 @@ class MiniT2ILoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_type) -> io.NodeOutput:
-        transformer = MiniT2IPipeline.load_transformer(model_type)
-        return io.NodeOutput(ModelPatcher(MiniT2IModule(transformer), mm.get_torch_device(), mm.unet_offload_device()),)
+        cached = _TRANSFORMER_CACHE.get(model_type)
+        if cached is None:
+            transformer = MiniT2IPipeline.load_transformer(model_type)
+            cached = ModelPatcher(MiniT2IModule(transformer), mm.get_torch_device(), mm.unet_offload_device())
+            _TRANSFORMER_CACHE[model_type] = cached
+        return io.NodeOutput(cached.clone(),)
 
 
 class MiniT2ISampler(io.ComfyNode):
@@ -156,8 +183,36 @@ class MiniT2ISampler(io.ComfyNode):
     def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, image=None, control=None) -> io.NodeOutput:
         torch.manual_seed(seed)
 
-        mm.load_models_gpu([model, text_encoder] + [c["depth_model"] for c in control or [] if "depth_model" in c])
         transformer = model.model.module
+        te_module = text_encoder.model.module
+        tokenizer = text_encoder.model.tokenizer
+        prompt_length = transformer.mmjit_config.prompt_length
+        cache_key = (id(te_module), prompt, prompt_length)
+        cached_embeds = _PROMPT_CACHE.get(cache_key)
+
+        depth_models = [c["depth_model"] for c in control or [] if "depth_model" in c]
+        if cached_embeds is not None:
+            _PROMPT_CACHE.move_to_end(cache_key)
+            mm.load_models_gpu([model] + depth_models)
+            text_emb, attn_mask = cached_embeds
+        else:
+            mm.load_models_gpu([model, text_encoder] + depth_models)
+            te_device = next(te_module.parameters()).device
+            with torch.no_grad():
+                tokens = tokenizer(
+                    [prompt],
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=prompt_length,
+                )
+                input_ids = tokens.input_ids.to(te_device)
+                attn_mask = tokens.attention_mask.to(te_device)
+                text_emb = te_module(input_ids=input_ids, attention_mask=attn_mask).last_hidden_state
+            _PROMPT_CACHE[cache_key] = (text_emb.detach().cpu(), attn_mask.detach().cpu())
+            if len(_PROMPT_CACHE) > _PROMPT_CACHE_MAX:
+                _PROMPT_CACHE.popitem(last=False)
+
         num_images = 1
         if image is not None:
             size = transformer.mmjit_config.image_size
@@ -168,6 +223,10 @@ class MiniT2ISampler(io.ComfyNode):
                 image = comfy.utils.common_upscale(image, max(size, round(width * scale)), max(size, round(height * scale)), "bilinear", "disabled")
             image = (image * 2 - 1).to(transformer.device, transformer.dtype)
             num_images = image.shape[0]
+
+        if num_images > 1:
+            text_emb = text_emb.expand(num_images, -1, -1)
+            attn_mask = attn_mask.expand(num_images, -1)
 
         guide = None
         if control:
@@ -181,9 +240,9 @@ class MiniT2ISampler(io.ComfyNode):
             mm.throw_exception_if_processing_interrupted()
             pbar.update_absolute(done, total)
 
-        output = MiniT2IPipeline()(
+        output = _PIPELINE(
             prompt,
-            transformer, text_encoder.model.module, text_encoder.model.tokenizer,
+            transformer, te_module, tokenizer,
             model_dir=transformer.config._name_or_path.parent,
             guidance_scale=guidance,
             num_inference_steps=steps,
@@ -193,6 +252,7 @@ class MiniT2ISampler(io.ComfyNode):
             tile_overlap=tile_overlap,
             callback=callback,
             guide=guide,
+            prompt_embeds=(text_emb, attn_mask),
             output_type="pt",
         )
  
@@ -235,5 +295,10 @@ class MiniT2IControl(io.ComfyNode):
     def execute(cls, image, control_type, strength, start, end, control=None) -> io.NodeOutput:
         entry = {"type": control_type, "image": image, "strength": strength, "start": start, "end": end}
         if control_type != "edge":
-            entry["depth_model"] = comfy.sd.load_diffusion_model(folder_paths.get_full_path_or_raise("geometry_estimation", DEPTH_ESTIMATOR))
+            depth_path = folder_paths.get_full_path_or_raise("geometry_estimation", DEPTH_ESTIMATOR)
+            cached_depth = _DEPTH_MODEL_CACHE.get(depth_path)
+            if cached_depth is None:
+                cached_depth = comfy.sd.load_diffusion_model(depth_path)
+                _DEPTH_MODEL_CACHE[depth_path] = cached_depth
+            entry["depth_model"] = cached_depth.clone()
         return io.NodeOutput((control or []) + [entry],)

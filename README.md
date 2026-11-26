@@ -11,7 +11,7 @@ Workflows are in the templates section.
 | l16 | 4.3GB |
 
 
-Just a quickie.  Bit slow cause the model is not cached in memory.
+Models, schedulers, and recent prompt embeddings are cached in memory (managed via ComfyUI's `ModelPatcher` for VRAM offloading), and attention uses PyTorch's fused `scaled_dot_product_attention`.
 
 ### Changes
 
