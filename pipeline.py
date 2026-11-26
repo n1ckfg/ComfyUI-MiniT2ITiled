@@ -1,9 +1,11 @@
+import itertools
 import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from torch import nn
+from torch.func import functional_call
 import torch.nn.functional as F
 
 
@@ -363,8 +365,27 @@ class DiffusionModel(nn.Module):
                 tile_callback()
         return v
 
+    def tiled_cond_x0(self, x, t, text, mask, tiles):
+        size = self.cfg.image_size
+        x0 = torch.zeros_like(x)
+        for y, x1, weight in tiles:
+            x0[:, :, y:y + size, x1:x1 + size].addcmul_(self.net(x[:, :, y:y + size, x1:x1 + size], t, text, mask), weight)
+        return x0
+
+    def tiled_x0_vjp(self, params, x, t, text, mask, tiles, grad_x0):
+        # Vector-Jacobian product of the blended conditional x0 prediction w.r.t. x, one tile at a time
+        # so activations are never held for the whole canvas.
+        size = self.cfg.image_size
+        g = torch.zeros_like(grad_x0)
+        for y, x0, weight in tiles:
+            xt = x[:, :, y:y + size, x0:x0 + size].clone().requires_grad_(True)
+            pred = functional_call(self.net, params, (xt, t.clone(), text.clone(), mask.clone()))
+            tile_g, = torch.autograd.grad(pred, xt, grad_outputs=grad_x0[:, :, y:y + size, x0:x0 + size] * weight)
+            g[:, :, y:y + size, x0:x0 + size] += tile_g
+        return g
+
     @torch.no_grad()
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None):
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None, guide=None):
         b = text.shape[0]
         device = text.device
         dtype = next(self.parameters()).dtype
@@ -384,6 +405,11 @@ class DiffusionModel(nn.Module):
                 nonlocal done
                 done += 1
                 callback(done, total)
+        if guide is not None:
+            # ComfyUI loads weights under inference_mode and autograd can't save inference tensors,
+            # so guidance backpropagates through a clone that lives only for this call.
+            with torch.inference_mode(False):
+                params = {k: p.clone() for k, p in itertools.chain(self.net.named_parameters(), self.net.named_buffers())}
         timesteps = torch.linspace(t_start, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
         iterator = range(self.cfg.n_T)
         if progress:
@@ -393,6 +419,12 @@ class DiffusionModel(nn.Module):
             t_cur = timesteps[i].expand(b)
             t_next = timesteps[i + 1].expand(b)
             v = self.tiled_cfg_velocity(x, t_cur, text.to(dtype), mask.to(dtype), cfg_scale, tiles, tile_callback)
+            t_float = t_start + (1.0 - t_start) * i / self.cfg.n_T
+            if guide is not None and guide.active(t_float):
+                remaining = torch.clamp(1 - t_cur, min=0.001)[:, None, None, None]
+                x0_cond = self.tiled_cond_x0(x, t_cur, text.to(dtype), mask.to(dtype), tiles)
+                vjp = lambda grad_x0: self.tiled_x0_vjp(params, x, t_cur, text.to(dtype), mask.to(dtype), tiles, grad_x0)
+                v = v - guide.correction(x0_cond, t_float, vjp) / remaining
             x = x + (t_next - t_cur)[:, None, None, None] * v
         return x
 
@@ -509,8 +541,8 @@ class MiniT2IMMJiTModel(ModelMixin, ConfigMixin):
     def pred_velocity(self, x, t, text, mask):
         return self.model.pred_velocity(x, t, text, mask)
 
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None):
-        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap, callback=callback)
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None, guide=None):
+        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap, callback=callback, guide=guide)
 
 
 class MiniT2ITextToImagePipeline(nn.Module):
@@ -631,6 +663,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
         denoise: float = 1.0,
         tile_overlap: int = 64,
         callback=None,
+        guide=None,
     ):
         device = next(self.transformer.parameters()).device
         if isinstance(prompt, str):
@@ -655,6 +688,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
                 denoise=denoise,
                 tile_overlap=tile_overlap,
                 callback=callback,
+                guide=guide,
             )
         finally:
             self.transformer.model.cfg.n_T = old_steps

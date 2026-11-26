@@ -1,10 +1,15 @@
 from comfy_api.latest import io
 import torch
 from .pipeline import MiniT2IPipeline
+from .control import Guide, CONTROL_TYPES
 from comfy.model_patcher import ModelPatcher
 import comfy.model_management as mm
 import comfy.utils
 from transformers import AutoTokenizer, T5EncoderModel
+
+
+MiniT2IControlType = io.Custom("MINIT2I_CONTROL")
+DA3ModelType = io.Custom("DA3_MODEL")
 
 
 class MiniT2IModule(torch.nn.Module):
@@ -117,6 +122,7 @@ class MiniT2ISampler(io.ComfyNode):
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used with an image. Lower keeps more of the input image."),
                 io.Image.Input("image", optional=True, tooltip="Input image for image to image. Images larger than 512x512 are sampled in overlapping 512x512 tiles at their own size."),
                 io.Int.Input("tile_overlap", default=64, min=0, max=256, step=8, tooltip="Overlap in pixels between 512x512 tiles when the image is larger than 512x512."),
+                MiniT2IControlType.Input("control", optional=True, tooltip="Use MiniT2I Control"),
             ],
             outputs=[
                 io.Image.Output(),
@@ -144,10 +150,10 @@ class MiniT2ISampler(io.ComfyNode):
 
 
     @classmethod
-    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, image=None) -> io.NodeOutput:
+    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, image=None, control=None) -> io.NodeOutput:
         torch.manual_seed(seed)
 
-        mm.load_models_gpu([model, text_encoder])
+        mm.load_models_gpu([model, text_encoder] + [c["depth_model"] for c in control or [] if "depth_model" in c])
         transformer = model.model.module
         num_images = 1
         if image is not None:
@@ -159,6 +165,12 @@ class MiniT2ISampler(io.ComfyNode):
                 image = comfy.utils.common_upscale(image, max(size, round(width * scale)), max(size, round(height * scale)), "bilinear", "disabled")
             image = (image * 2 - 1).to(transformer.device, transformer.dtype)
             num_images = image.shape[0]
+
+        guide = None
+        if control:
+            size = transformer.mmjit_config.image_size
+            height, width = image.shape[-2:] if image is not None else (size, size)
+            guide = Guide(control, height, width, transformer.device)
 
         pbar = comfy.utils.ProgressBar(steps)
 
@@ -177,6 +189,7 @@ class MiniT2ISampler(io.ComfyNode):
             denoise=denoise,
             tile_overlap=tile_overlap,
             callback=callback,
+            guide=guide,
             output_type="pt",
         )
  
@@ -194,3 +207,33 @@ class MiniT2ISampler(io.ComfyNode):
     #def fingerprint_inputs(s, image, string_field, int_field, float_field, print_to_screen):
     #    return ""
 
+
+class MiniT2IControl(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="MiniT2IControl",
+            display_name="MiniT2I Control",
+            category="MiniT2I",
+            inputs=[
+                io.Image.Input("image", tooltip="Control map, e.g. from a Canny, Lineart or HED preprocessor."),
+                io.Combo.Input("control_type", options=list(CONTROL_TYPES)),
+                io.Float.Input("strength", default=0.4, min=0.0, max=4.0, step=0.05),
+                io.Float.Input("start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Sampling progress where guidance starts."),
+                io.Float.Input("end", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="Sampling progress where guidance stops. Later steps only refine detail."),
+                MiniT2IControlType.Input("control", optional=True, tooltip="Previous MiniT2I Control, to combine several."),
+                DA3ModelType.Input("depth_model", optional=True, tooltip="Load Depth Anything 3 (Small is fastest). Required for depth and normal."),
+            ],
+            outputs=[
+                MiniT2IControlType.Output(),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, image, control_type, strength, start, end, control=None, depth_model=None) -> io.NodeOutput:
+        entry = {"type": control_type, "image": image, "strength": strength, "start": start, "end": end}
+        if control_type != "edge":
+            if depth_model is None:
+                raise ValueError(f"MiniT2I Control: '{control_type}' needs a depth_model from Load Depth Anything 3.")
+            entry["depth_model"] = depth_model
+        return io.NodeOutput((control or []) + [entry],)

@@ -1,6 +1,6 @@
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
-from .MiniT2I import MiniT2ISampler, MiniT2ILoader, MiniT2ITextEncoder
+from .MiniT2I import MiniT2ISampler, MiniT2ILoader, MiniT2ITextEncoder, MiniT2IControl
 
 
 class MiniT2IExtension(ComfyExtension):
@@ -10,6 +10,7 @@ class MiniT2IExtension(ComfyExtension):
             MiniT2ISampler,
             MiniT2ILoader,
             MiniT2ITextEncoder,
+            MiniT2IControl,
         ]
 
 
