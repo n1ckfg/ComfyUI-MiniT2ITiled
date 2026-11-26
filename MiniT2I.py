@@ -4,12 +4,15 @@ from .pipeline import MiniT2IPipeline
 from .control import Guide, CONTROL_TYPES
 from comfy.model_patcher import ModelPatcher
 import comfy.model_management as mm
+import comfy.sd
 import comfy.utils
+import folder_paths
 from transformers import AutoTokenizer, T5EncoderModel
 
 
 MiniT2IControlType = io.Custom("MINIT2I_CONTROL")
-DA3ModelType = io.Custom("DA3_MODEL")
+# Estimates depth of the image being generated so depth and normal controls can compare it with the control map.
+DEPTH_ESTIMATOR = "depth_anything_3_small.safetensors"
 
 
 class MiniT2IModule(torch.nn.Module):
@@ -216,13 +219,12 @@ class MiniT2IControl(io.ComfyNode):
             display_name="MiniT2I Control",
             category="MiniT2I",
             inputs=[
-                io.Image.Input("image", tooltip="Control map, e.g. from a Canny, Lineart or HED preprocessor."),
+                io.Image.Input("image", tooltip="Control map. edge: white lines on black (Canny, Lineart, HED). depth: near = white. normal: ControlNet/BAE convention."),
                 io.Combo.Input("control_type", options=list(CONTROL_TYPES)),
                 io.Float.Input("strength", default=0.4, min=0.0, max=4.0, step=0.05),
                 io.Float.Input("start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Sampling progress where guidance starts."),
                 io.Float.Input("end", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="Sampling progress where guidance stops. Later steps only refine detail."),
                 MiniT2IControlType.Input("control", optional=True, tooltip="Previous MiniT2I Control, to combine several."),
-                DA3ModelType.Input("depth_model", optional=True, tooltip="Load Depth Anything 3 (Small is fastest). Required for depth and normal."),
             ],
             outputs=[
                 MiniT2IControlType.Output(),
@@ -230,10 +232,8 @@ class MiniT2IControl(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, image, control_type, strength, start, end, control=None, depth_model=None) -> io.NodeOutput:
+    def execute(cls, image, control_type, strength, start, end, control=None) -> io.NodeOutput:
         entry = {"type": control_type, "image": image, "strength": strength, "start": start, "end": end}
         if control_type != "edge":
-            if depth_model is None:
-                raise ValueError(f"MiniT2I Control: '{control_type}' needs a depth_model from Load Depth Anything 3.")
-            entry["depth_model"] = depth_model
+            entry["depth_model"] = comfy.sd.load_diffusion_model(folder_paths.get_full_path_or_raise("geometry_estimation", DEPTH_ESTIMATOR))
         return io.NodeOutput((control or []) + [entry],)
