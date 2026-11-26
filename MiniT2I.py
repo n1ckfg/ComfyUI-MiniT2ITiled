@@ -152,6 +152,7 @@ class MiniT2ISampler(io.ComfyNode):
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Only used with an image. Lower keeps more of the input image."),
                 io.Image.Input("image", optional=True, tooltip="Input image for image to image. Images larger than 512x512 are sampled in overlapping 512x512 tiles at their own size."),
                 io.Int.Input("tile_overlap", default=64, min=0, max=256, step=8, tooltip="Overlap in pixels between 512x512 tiles when the image is larger than 512x512."),
+                io.Int.Input("tile_batch_size", default=4, min=1, max=64, step=1, tooltip="Maximum number of 512x512 tiles to evaluate in parallel per batch. Higher is faster on large images but uses more VRAM."),
                 MiniT2IControlType.Input("control", optional=True, tooltip="Use MiniT2I Control"),
             ],
             outputs=[
@@ -180,7 +181,7 @@ class MiniT2ISampler(io.ComfyNode):
 
 
     @classmethod
-    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, image=None, control=None) -> io.NodeOutput:
+    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, tile_batch_size=4, image=None, control=None) -> io.NodeOutput:
         torch.manual_seed(seed)
 
         transformer = model.model.module
@@ -250,6 +251,7 @@ class MiniT2ISampler(io.ComfyNode):
             image=image,
             denoise=denoise,
             tile_overlap=tile_overlap,
+            tile_batch_size=tile_batch_size,
             callback=callback,
             guide=guide,
             prompt_embeds=(text_emb, attn_mask),

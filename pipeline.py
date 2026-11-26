@@ -321,25 +321,30 @@ class MMJiT(nn.Module):
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape(b, c, h * p, w * p)
 
-    def forward(self, img, t, context, attn_mask):
-        if img.ndim == 4 and img.shape[1] != self.cfg.in_channels:
-            img = img.permute(0, 3, 1, 2)
+    def prepare_text(self, context, attn_mask):
         attn_mask = attn_mask.to(device=context.device)
         context = torch.where(attn_mask[:, :, None] > 0.5, context, self.mask_token.to(dtype=context.dtype))
+        txt = self.txt_embedder(context.to(dtype=self.txt_embedder.weight.dtype))
+        pooled_text = context.mean(dim=1)
+        pooled_vec = self.pooled_embedder(pooled_text.to(dtype=self.pooled_embedder.weight.dtype))
+        for block in self.txt_preamble_blocks:
+            txt = block(txt)
+        return txt, pooled_vec
+
+    def forward(self, img, t, context, attn_mask, prepared_text=None):
+        if img.ndim == 4 and img.shape[1] != self.cfg.in_channels:
+            img = img.permute(0, 3, 1, 2)
+        if prepared_text is None:
+            txt, pooled_vec = self.prepare_text(context, attn_mask)
+        else:
+            txt, pooled_vec = prepared_text
         x = self.img_embedder(img)
         pos = get_2d_sincos_pos_embed(self.cfg.hidden_size, self.latent_img_size, x.device, x.dtype)
         x = x + pos[None]
-        t_vec = self.t_embedder(t)
-        txt = self.txt_embedder(context.to(dtype=self.txt_embedder.weight.dtype))
-        pooled_text = context.mean(dim=1)
-        vec = t_vec + self.pooled_embedder(pooled_text.to(dtype=self.pooled_embedder.weight.dtype))
-        for block in self.txt_preamble_blocks:
-            txt = block(txt)
+        vec = self.t_embedder(t) + pooled_vec
         for block in self.double_blocks:
             x, txt = block(x, txt, vec)
-        combined = torch.cat([txt, x], dim=1)
-        out = self.final_layer(combined, vec)
-        img_out = out[:, txt.shape[1] :, :]
+        img_out = self.final_layer(x, vec)
         return self.unpatchify(img_out)
 
 
@@ -348,6 +353,34 @@ def tile_starts(length, size, overlap):
         return [0]
     n = math.ceil((length - size) / (size - overlap)) + 1
     return [(length - size) * i // (n - 1) for i in range(n)]
+
+
+def _repeat_batch(tensor, k: int, b: int):
+    if k == 1:
+        return tensor
+    if b == 1:
+        return tensor.expand(k, *tensor.shape[1:])
+    return tensor.repeat(k, *([1] * (tensor.ndim - 1)))
+
+
+def _repeat_prepared(prepared, k: int, b: int):
+    if prepared is None:
+        return None
+    return (_repeat_batch(prepared[0], k, b), _repeat_batch(prepared[1], k, b))
+
+
+def _is_oom_error(exc: Exception) -> bool:
+    oom_cls = getattr(torch, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(exc, oom_cls):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _empty_device_cache(device: torch.device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
 
 class DiffusionModel(nn.Module):
@@ -363,18 +396,25 @@ class DiffusionModel(nn.Module):
         x0 = self.net(x, self.real_t_to_embed_t(t), text, mask)
         return (x0 - x) / torch.clamp(1 - t[:, None, None, None], min=0.001)
 
-    def _cfg_velocity_and_x0(self, x, t, text, mask, cfg_scale: float):
+    def _cfg_velocity_and_x0(self, x, t, text, mask, cfg_scale: float, prepared_cond=None, prepared_uncond=None):
         b = x.shape[0]
         use_cfg = (t >= self.cfg.cfg_interval[0]) & (t <= self.cfg.cfg_interval[1])
         if cfg_scale == 1.0 or not bool(use_cfg.any()):
-            x0_cond = self.net(x, self.real_t_to_embed_t(t), text, mask)
+            x0_cond = self.net(x, self.real_t_to_embed_t(t), text, mask, prepared_text=prepared_cond)
             v = (x0_cond - x) / torch.clamp(1 - t[:, None, None, None], min=0.001)
             return v, x0_cond
         xx = torch.cat([x, x], dim=0)
         tt = torch.cat([t, t], dim=0)
-        yy = torch.cat([text, text], dim=0)
-        mm = torch.cat([mask, torch.zeros_like(mask)], dim=0)
-        x0_all = self.net(xx, self.real_t_to_embed_t(tt), yy, mm)
+        if prepared_cond is not None and prepared_uncond is not None:
+            prepared_all = (
+                torch.cat([prepared_cond[0], prepared_uncond[0]], dim=0),
+                torch.cat([prepared_cond[1], prepared_uncond[1]], dim=0),
+            )
+            x0_all = self.net(xx, self.real_t_to_embed_t(tt), None, None, prepared_text=prepared_all)
+        else:
+            yy = torch.cat([text, text], dim=0)
+            mm = torch.cat([mask, torch.zeros_like(mask)], dim=0)
+            x0_all = self.net(xx, self.real_t_to_embed_t(tt), yy, mm)
         out = (x0_all - xx) / torch.clamp(1 - tt[:, None, None, None], min=0.001)
         cond, uncond = out[:b], out[b:]
         if bool(use_cfg.all()):
@@ -399,42 +439,134 @@ class DiffusionModel(nn.Module):
             total[y:y + size, x:x + size] += window
         return [(y, x, (window / total[y:y + size, x:x + size]).to(dtype)) for y, x in tiles]
 
-    def tiled_cfg_velocity(self, x, t, text, mask, cfg_scale, tiles, tile_callback=None, return_x0=False):
+    def tiled_cfg_velocity(
+        self,
+        x,
+        t,
+        text,
+        mask,
+        cfg_scale,
+        tiles,
+        tile_callback=None,
+        return_x0=False,
+        tile_batch_size: int = 1,
+        prepared_cond=None,
+        prepared_uncond=None,
+        batch_state=None,
+    ):
         size = self.cfg.image_size
+        b = x.shape[0]
+        n_tiles = len(tiles)
+        if n_tiles == 1 and x.shape[-2] == size and x.shape[-1] == size:
+            v, x0_cond = self._cfg_velocity_and_x0(
+                x, t, text, mask, cfg_scale,
+                prepared_cond=prepared_cond,
+                prepared_uncond=prepared_uncond,
+            )
+            if tile_callback is not None:
+                tile_callback(1)
+            return (v, x0_cond) if return_x0 else v
+
         v = torch.zeros_like(x)
         x0_cond = torch.zeros_like(x) if return_x0 else None
-        for y, x0, weight in tiles:
-            tile_v, tile_x0 = self._cfg_velocity_and_x0(x[:, :, y:y + size, x0:x0 + size], t, text, mask, cfg_scale)
-            v[:, :, y:y + size, x0:x0 + size].addcmul_(tile_v, weight)
-            if return_x0:
-                x0_cond[:, :, y:y + size, x0:x0 + size].addcmul_(tile_x0, weight)
+        active_batch = batch_state[0] if batch_state is not None else max(1, int(tile_batch_size) // b)
+        idx = 0
+        while idx < n_tiles:
+            remaining = n_tiles - idx
+            n_chunks = math.ceil(remaining / active_batch)
+            k = math.ceil(remaining / n_chunks)
+            chunk = tiles[idx:idx + k]
+            try:
+                if k == 1:
+                    y, x0, _ = chunk[0]
+                    tile_x = x[:, :, y:y + size, x0:x0 + size]
+                else:
+                    tile_x = torch.cat([x[:, :, y:y + size, x0:x0 + size] for y, x0, _ in chunk], dim=0)
+                t_c = _repeat_batch(t, k, b)
+                if prepared_cond is not None:
+                    p_cond = _repeat_prepared(prepared_cond, k, b)
+                    p_uncond = _repeat_prepared(prepared_uncond, k, b)
+                    text_c, mask_c = None, None
+                else:
+                    p_cond, p_uncond = None, None
+                    text_c = _repeat_batch(text, k, b)
+                    mask_c = _repeat_batch(mask, k, b)
+                chunk_v, chunk_x0 = self._cfg_velocity_and_x0(
+                    tile_x, t_c, text_c, mask_c, cfg_scale,
+                    prepared_cond=p_cond,
+                    prepared_uncond=p_uncond,
+                )
+            except Exception as e:
+                if active_batch <= 1 or not _is_oom_error(e):
+                    raise
+                _empty_device_cache(x.device)
+                active_batch = max(1, k // 2)
+                if batch_state is not None:
+                    batch_state[0] = active_batch
+                continue
+
+            for ci, (y, x0, weight) in enumerate(chunk):
+                sl = slice(ci * b, (ci + 1) * b)
+                v[:, :, y:y + size, x0:x0 + size].addcmul_(chunk_v[sl], weight)
+                if return_x0:
+                    x0_cond[:, :, y:y + size, x0:x0 + size].addcmul_(chunk_x0[sl], weight)
+            idx += k
             if tile_callback is not None:
-                tile_callback()
+                tile_callback(k)
         if return_x0:
             return v, x0_cond
         return v
 
-    def tiled_cond_x0(self, x, t, text, mask, tiles):
+    def tiled_cond_x0(self, x, t, text, mask, tiles, tile_batch_size: int = 1, prepared_cond=None):
         size = self.cfg.image_size
+        b = x.shape[0]
+        n_tiles = len(tiles)
+        if n_tiles == 1 and x.shape[-2] == size and x.shape[-1] == size:
+            return self.net(x, t, text, mask, prepared_text=prepared_cond)
         x0 = torch.zeros_like(x)
-        for y, x1, weight in tiles:
-            x0[:, :, y:y + size, x1:x1 + size].addcmul_(self.net(x[:, :, y:y + size, x1:x1 + size], t, text, mask), weight)
+        active_batch = max(1, int(tile_batch_size) // b)
+        idx = 0
+        while idx < n_tiles:
+            remaining = n_tiles - idx
+            n_chunks = math.ceil(remaining / active_batch)
+            k = math.ceil(remaining / n_chunks)
+            chunk = tiles[idx:idx + k]
+            tile_x = (
+                x[:, :, chunk[0][0]:chunk[0][0] + size, chunk[0][1]:chunk[0][1] + size]
+                if k == 1
+                else torch.cat([x[:, :, y:y + size, x1:x1 + size] for y, x1, _ in chunk], dim=0)
+            )
+            t_c = _repeat_batch(t, k, b)
+            p_cond = _repeat_prepared(prepared_cond, k, b)
+            text_c = None if p_cond is not None else _repeat_batch(text, k, b)
+            mask_c = None if p_cond is not None else _repeat_batch(mask, k, b)
+            chunk_x0 = self.net(tile_x, t_c, text_c, mask_c, prepared_text=p_cond)
+            for ci, (y, x1, weight) in enumerate(chunk):
+                sl = slice(ci * b, (ci + 1) * b)
+                x0[:, :, y:y + size, x1:x1 + size].addcmul_(chunk_x0[sl], weight)
+            idx += k
         return x0
 
-    def tiled_x0_vjp(self, params, x, t, text, mask, tiles, grad_x0):
+    def tiled_x0_vjp(self, params, x, t, text, mask, tiles, grad_x0, prepared_text=None):
         # Vector-Jacobian product of the blended conditional x0 prediction w.r.t. x, one tile at a time
         # so activations are never held for the whole canvas.
         size = self.cfg.image_size
         g = torch.zeros_like(grad_x0)
+        t_c = t.clone()
+        text_c = None if prepared_text is not None else text.clone()
+        mask_c = None if prepared_text is not None else mask.clone()
         for y, x0, weight in tiles:
             xt = x[:, :, y:y + size, x0:x0 + size].clone().requires_grad_(True)
-            pred = functional_call(self.net, params, (xt, t.clone(), text.clone(), mask.clone()))
+            if prepared_text is not None:
+                pred = functional_call(self.net, params, (xt, t_c, None, None), {"prepared_text": prepared_text})
+            else:
+                pred = functional_call(self.net, params, (xt, t_c, text_c, mask_c))
             tile_g, = torch.autograd.grad(pred, xt, grad_outputs=grad_x0[:, :, y:y + size, x0:x0 + size] * weight)
             g[:, :, y:y + size, x0:x0 + size] += tile_g
         return g
 
     @torch.no_grad()
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None, guide=None):
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, tile_batch_size=1, callback=None, guide=None):
         b = text.shape[0]
         device = text.device
         dtype = next(self.parameters()).dtype
@@ -450,17 +582,21 @@ class DiffusionModel(nn.Module):
             total = self.cfg.n_T * len(tiles)
             done = 0
 
-            def tile_callback():
+            def tile_callback(n=1):
                 nonlocal done
-                done += 1
+                done += n
                 callback(done, total)
-        if guide is not None:
-            # ComfyUI loads weights under inference_mode and autograd can't save inference tensors,
-            # so guidance backpropagates through a clone that lives only for this call.
-            with torch.inference_mode(False):
-                params = {k: p.clone() for k, p in itertools.chain(self.net.named_parameters(), self.net.named_buffers())}
         text_dtype = text.to(dtype)
         mask_dtype = mask.to(dtype)
+        cond_prepared = self.net.prepare_text(text_dtype, mask_dtype)
+        uncond_prepared = self.net.prepare_text(text_dtype, torch.zeros_like(mask_dtype)) if cfg_scale != 1.0 else None
+        if guide is not None:
+            # ComfyUI loads weights under inference_mode and autograd can't save inference tensors,
+            # so guidance backpropagates through a detached clone that lives only for this call.
+            with torch.inference_mode(False):
+                params = {k: p.detach().clone() for k, p in itertools.chain(self.net.named_parameters(), self.net.named_buffers())}
+                vjp_prepared = (cond_prepared[0].detach().clone(), cond_prepared[1].detach().clone())
+        batch_state = [max(1, int(tile_batch_size) // b)]
         timesteps = torch.linspace(t_start, 1.0, self.cfg.n_T + 1, device=device, dtype=dtype)
         iterator = range(self.cfg.n_T)
         if progress:
@@ -472,12 +608,25 @@ class DiffusionModel(nn.Module):
             t_float = t_start + (1.0 - t_start) * i / self.cfg.n_T
             need_guide = guide is not None and guide.active(t_float)
             if need_guide:
-                v, x0_cond = self.tiled_cfg_velocity(x, t_cur, text_dtype, mask_dtype, cfg_scale, tiles, tile_callback, return_x0=True)
+                v, x0_cond = self.tiled_cfg_velocity(
+                    x, t_cur, text_dtype, mask_dtype, cfg_scale, tiles, tile_callback,
+                    return_x0=True,
+                    tile_batch_size=tile_batch_size,
+                    prepared_cond=cond_prepared,
+                    prepared_uncond=uncond_prepared,
+                    batch_state=batch_state,
+                )
                 remaining = torch.clamp(1 - t_cur, min=0.001)[:, None, None, None]
-                vjp = lambda grad_x0: self.tiled_x0_vjp(params, x, t_cur, text_dtype, mask_dtype, tiles, grad_x0)
+                vjp = lambda grad_x0: self.tiled_x0_vjp(params, x, t_cur, text_dtype, mask_dtype, tiles, grad_x0, prepared_text=vjp_prepared)
                 v = v - guide.correction(x0_cond, t_float, vjp) / remaining
             else:
-                v = self.tiled_cfg_velocity(x, t_cur, text_dtype, mask_dtype, cfg_scale, tiles, tile_callback)
+                v = self.tiled_cfg_velocity(
+                    x, t_cur, text_dtype, mask_dtype, cfg_scale, tiles, tile_callback,
+                    tile_batch_size=tile_batch_size,
+                    prepared_cond=cond_prepared,
+                    prepared_uncond=uncond_prepared,
+                    batch_state=batch_state,
+                )
             x = x + (t_next - t_cur)[:, None, None, None] * v
         return x
 
@@ -594,8 +743,8 @@ class MiniT2IMMJiTModel(ModelMixin, ConfigMixin):
     def pred_velocity(self, x, t, text, mask):
         return self.model.pred_velocity(x, t, text, mask)
 
-    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, callback=None, guide=None):
-        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap, callback=callback, guide=guide)
+    def sample(self, text, mask, cfg_scale=6.0, generator=None, progress=False, image=None, denoise=1.0, tile_overlap=64, tile_batch_size=1, callback=None, guide=None):
+        return self.model.sample(text, mask, cfg_scale=cfg_scale, generator=generator, progress=progress, image=image, denoise=denoise, tile_overlap=tile_overlap, tile_batch_size=tile_batch_size, callback=callback, guide=guide)
 
 
 class MiniT2ITextToImagePipeline(nn.Module):
@@ -715,6 +864,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
         image: Optional[torch.Tensor] = None,
         denoise: float = 1.0,
         tile_overlap: int = 64,
+        tile_batch_size: int = 1,
         callback=None,
         guide=None,
         prompt_embeds: Optional[tuple] = None,
@@ -746,6 +896,7 @@ class MiniT2ITextToImagePipeline(nn.Module):
                 image=image,
                 denoise=denoise,
                 tile_overlap=tile_overlap,
+                tile_batch_size=tile_batch_size,
                 callback=callback,
                 guide=guide,
             )

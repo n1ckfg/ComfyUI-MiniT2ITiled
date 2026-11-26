@@ -92,6 +92,7 @@ flowchart LR
   - `denoise` (`Float`, default `1.0`, range `0.0–1.0`)
   - `image` (`Image`, optional): img2img input
   - `tile_overlap` (`Int`, default `64`, range `0–256`, step `8`)
+  - `tile_batch_size` (`Int`, default `4`, range `1–64`, step `1`)
   - `control` (`MINIT2I_CONTROL`, optional)
 - **Outputs:** `IMAGE`
 - **Behavior:**
@@ -99,7 +100,7 @@ flowchart LR
   2. Calls `mm.load_models_gpu` on the transformer, the text encoder, and any depth models in `control`.
   3. With an `image`: drops alpha, converts to NCHW, upscales bilinearly (`comfy.utils.common_upscale`) so the short side is at least `image_size` (512), rescales to `[-1, 1]`, and casts to the transformer's device and dtype. The image batch size becomes `num_images_per_prompt`.
   4. With `control`: builds a `control.Guide` at the canvas size (the image size, or 512 × 512 without an image).
-  5. Creates a `comfy.utils.ProgressBar`. Its callback checks `mm.throw_exception_if_processing_interrupted()` and updates the bar after each tile evaluation.
+  5. Creates a `comfy.utils.ProgressBar`. Its callback checks `mm.throw_exception_if_processing_interrupted()` and updates the bar after each tile batch evaluation.
   6. Runs `MiniT2IPipeline()(prompt, transformer, text_encoder, tokenizer, model_dir=transformer.config._name_or_path.parent, ...)` with `output_type="pt"` and returns `output.images`.
 
 ---
@@ -130,18 +131,18 @@ Default (`b16`) configuration:
    - Shared Q/K `RMSNorm` and joint attention over concatenated `[txt, img]` sequences using `MultiModalRotaryEmbeddingFast` (1D RoPE on text tokens, 2D RoPE via `VisionRotaryEmbeddingFast` on the square image token grid).
    - Attention is computed with `torch.einsum` + `softmax`.
 5. **Output Head (`FinalLayer` + `unpatchify`):**
-   - Applies `RMSNorm` and a linear projection to `patch_size * patch_size * out_channels`, slices out the image tokens, and reshapes back to `(B, 3, H, W)`.
+   - Applies `RMSNorm` and a linear projection to `patch_size * patch_size * out_channels` directly on the image tokens, and reshapes back to `(B, 3, H, W)`.
 
 ### Flow Matching & Sampling (`DiffusionModel`)
 Time runs from $t = 0$ (noise) to $t = 1$ (clean image).
 - **x-Prediction to Velocity (`pred_velocity`):** Predicts the clean image $x_0 = \text{MMJiT}(x_t, t, \text{text}, \text{mask})$ and derives velocity:
   $$v = \frac{x_0 - x_t}{\max(1 - t,\; 0.001)}$$
 - **Classifier-Free Guidance (`cfg_velocity`):** Concatenates conditional (`mask`) and unconditional (`zeros_like(mask)`) batches into a single forward pass and applies `uncond + (cond - uncond) * cfg_scale` for timesteps inside `cfg_interval`.
-- **Tiling (`tile_starts`, `tile_weights`, `tiled_cfg_velocity`):** The canvas is covered by `image_size × image_size` tiles spread evenly so neighbours overlap by at least `tile_overlap` pixels. Each tile gets a separable linear-ramp window, normalized so the windows sum to 1 at every pixel. Velocities from each tile are blended with `addcmul_`. A 512 × 512 canvas is a single tile with weight 1.
+- **Tiling (`tile_starts`, `tile_weights`, `tiled_cfg_velocity`):** The canvas is covered by `image_size × image_size` tiles spread evenly so neighbours overlap by at least `tile_overlap` pixels. Each tile gets a separable linear-ramp window, normalized so the windows sum to 1 at every pixel. Tiles are evaluated in balanced batches of up to `max(1, tile_batch_size // B)` tiles per forward pass (with OOM-adaptive batch halving) and blended back with `addcmul_`. A 512 × 512 canvas takes a direct single-tile fast path with no blending buffer.
 - **Image-to-Image:** `t_start = 1 - denoise`. With an input image the initial state is `lerp(noise, image, t_start)`.
-- **Euler Integrator (`sample`):** Initializes noise as `torch.randn(...) * 2` at the canvas size and integrates from $t_\text{start}$ to $1.0$ over `n_T` uniform Euler steps:
+- **Euler Integrator (`sample`):** Initializes noise as `torch.randn(...) * 2` at the canvas size, precomputes the text preamble (`MMJiT.prepare_text`) once for conditional and unconditional conditioning, and integrates from $t_\text{start}$ to $1.0$ over `n_T` uniform Euler steps:
   $$x_{t_{i+1}} = x_{t_i} + (t_{i+1} - t_i) \cdot v$$
-- **Control Guidance:** When a `Guide` is active at the current $t$, `sample` also computes the tiled conditional $x_0$ (`tiled_cond_x0`) and subtracts `guide.correction(...) / max(1 - t, 0.001)` from $v$. The correction is pulled back to $x_t$ through `tiled_x0_vjp`, which runs `torch.func.functional_call` over a per-call clone of the network parameters, one tile at a time, so activations are never held for the whole canvas.
+- **Control Guidance:** When a `Guide` is active at the current $t$, `sample` reuses the tiled conditional $x_0$ from `tiled_cfg_velocity(..., return_x0=True)` and subtracts `guide.correction(...) / max(1 - t, 0.001)` from $v$. The correction is pulled back to $x_t$ through `tiled_x0_vjp`, which runs `torch.func.functional_call` over a per-call detached clone of the network parameters and precomputed text preamble, one tile at a time, so activations are never held for the whole canvas.
 
 ---
 
@@ -189,9 +190,10 @@ Control is training-free gradient guidance on the model's $x_0$ prediction; ther
 - **Attention & Caching:**
   - `PlainTextTransformerBlock` and `DoubleStreamDiTBlock` use `torch.nn.functional.scaled_dot_product_attention` (SDPA) instead of materialized `einsum` + `softmax`.
   - 2D sinusoidal positional embeddings and 1D/2D RoPE `cos`/`sin` tables are cached in memory (created outside `inference_mode` so autograd in `tiled_x0_vjp` works cleanly).
+  - `MMJiT.prepare_text` runs `txt_embedder`, `pooled_embedder`, and `txt_preamble_blocks` once per `sample()` call (for conditional and unconditional inputs) and reuses the result across all steps, tile batches, and VJP passes.
   - Loaded `ModelPatcher` instances for the transformer, text encoder, and Depth Anything 3 model, as well as the `MiniT2IFlowMatchScheduler` and the last 16 prompt embeddings, are cached in memory. On a prompt cache hit, the T5 text encoder does not need to be loaded onto GPU.
 - **Cost per step:**
-  - Each step runs one batch-of-2 CFG pass per tile (or a single conditional pass when `guidance == 1.0` or outside `cfg_interval`).
-  - Guided steps reuse the conditional $x_0$ from the CFG pass and add one VJP (forward + backward) per tile, plus the control losses (a Depth Anything 3 forward/backward for depth and normal).
+  - Each step evaluates tiles in balanced chunks of up to `max(1, tile_batch_size // B)` tiles, running one CFG pass (`2 × chunk × B` items) per chunk (or a single conditional pass when `guidance == 1.0` or outside `cfg_interval`).
+  - Guided steps reuse the conditional $x_0$ from the CFG pass and add one VJP (forward + backward) per tile sequentially, plus the control losses (a Depth Anything 3 forward/backward for depth and normal).
 - **Hub access:** `MiniT2ILoader` and `MiniT2ITextEncoder` try `local_files_only=True` first and only hit the Hugging Face Hub if the weights are not cached locally.
 - **Conditioning Vector (`vec`):** `MMJiT.forward` computes `vec = t_vec + pooled_embedder(pooled_text)` and passes it to `DoubleStreamDiTBlock` and `FinalLayer`, which accept it without applying AdaLN modulation. `modulate()` is defined but unused.
