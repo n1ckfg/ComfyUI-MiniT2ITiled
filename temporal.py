@@ -327,3 +327,28 @@ def temporal_bilateral_stabilize(
 
     return out.to(orig_dtype)
 
+
+def build_tile_flow_grids(
+    bwd_flows: torch.Tensor,
+    tiles,
+    tile_size: int,
+    patch_size: int,
+) -> torch.Tensor:
+    """Build normalized grid_sample coordinates (T, F - 1, side, side, 2) on each tile's patch grid
+    so frame (f - 1)'s pre-RoPE K/V tokens can be motion-warped into frame f's coordinates.
+    """
+    side = tile_size // patch_size
+    base = _make_base_grid(side, side, bwd_flows.device)[None]  # (1, 2, side, side)
+    scale_x = 2.0 / max(side - 1, 1)
+    scale_y = 2.0 / max(side - 1, 1)
+    grids = []
+    for y, x0, _ in tiles:
+        tile_flow = bwd_flows[:, :, y:y + tile_size, x0:x0 + tile_size].float()
+        pflow = F.interpolate(tile_flow, size=(side, side), mode="area") / float(patch_size)
+        coords = base + pflow
+        gx = coords[:, 0] * scale_x - 1.0
+        gy = coords[:, 1] * scale_y - 1.0
+        grids.append(torch.stack([gx, gy], dim=-1))
+    return torch.stack(grids, dim=0)  # (T, F - 1, side, side, 2)
+
+
