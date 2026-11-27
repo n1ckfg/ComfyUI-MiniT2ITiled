@@ -12,7 +12,7 @@
 | `MiniT2I.py` | ComfyUI node definitions (`MiniT2ITextEncoder`, `MiniT2ILoader`, `MiniT2ISampler`, `MiniT2IControl`), the `MiniT2IModule` wrapper and `ModelPatcher` integration. |
 | `pipeline.py` | Self-contained model implementation (`MMJiT`, `DiffusionModel` with tiling and guidance hooks), Diffusers wrappers (`MiniT2IMMJiTModel`, `MiniT2IFlowMatchScheduler`), and inference pipelines (`MiniT2ITextToImagePipeline`, `MiniT2IPipeline`). |
 | `control.py` | Control losses (`EdgeControl`, `DepthControl`, `NormalControl`) and the `Guide` that turns them into a sampling correction. |
-| `temporal.py` | Optical-flow estimation (OpenCV DIS with pure-PyTorch multi-scale Lucas-Kanade fallback), forward-backward occlusion masks, variance-preserving 2× sub-pixel noise warping, and early-step $x_0$ velocity anchoring. |
+| `temporal.py` | Optical-flow estimation (OpenCV DIS with pure-PyTorch multi-scale Lucas-Kanade fallback), forward-backward occlusion masks, variance-preserving 2× sub-pixel noise warping, early-step $x_0$ velocity anchoring, and post-sampling motion-compensated bilateral stabilization. |
 | `example_workflows/MiniT2I_example.json` | Reference text-to-image workflow connecting the loaders, sampler, and `PreviewImage`. |
 | `pyproject.toml` | Package metadata and Comfy Registry (`[tool.comfy]`) configuration. |
 | `.github/workflows/publish.yml` | Publishes the pack to the Comfy Registry. |
@@ -146,7 +146,7 @@ Time runs from $t = 0$ (noise) to $t = 1$ (clean image).
 - **Image-to-Image:** `t_start = 1 - denoise`. With an input image the initial state is `lerp(noise, image, t_start)`.
 - **Euler Integrator (`sample`):** Initializes noise as `torch.randn(...) * 2` at the canvas size (optionally correlating noise across frames when `shared_noise > 0` and `B > 1` — using static shared noise if `flow_consistency == 0`, or 2× sub-pixel optical-flow-warped noise via `temporal.warp_noise_sequence` when `flow_consistency > 0`), precomputes the text preamble (`MMJiT.prepare_text`) once for conditional and unconditional conditioning, and integrates from $t_\text{start}$ to $1.0$ over `n_T` uniform Euler steps:
   $$x_{t_{i+1}} = x_{t_i} + (t_{i+1} - t_i) \cdot v$$
-  When `flow_consistency > 0` on multi-frame image batches, `temporal.anchor_x0_velocity` additionally anchors early-step full-canvas $x_0$ predictions across consecutive frames along the backward optical flow (masked by forward-backward occlusion confidence and cosine-tapered to `0` at 65% progress so final steps sharpen cleanly).
+  When `flow_consistency > 0` on multi-frame image batches, `temporal.anchor_x0_velocity` additionally anchors early-step full-canvas $x_0$ predictions across consecutive frames along the backward optical flow (masked by forward-backward occlusion confidence and cosine-tapered to `0` at 65% progress so final steps sharpen cleanly), followed by a post-sampling motion-compensated bilateral filter (`temporal.temporal_bilateral_stabilize`) to damp residual high-frequency pixel shimmer without blurring moving edges.
 - **Control Guidance:** When a `Guide` is active at the current $t$, `sample` reuses the tiled conditional $x_0$ from `tiled_cfg_velocity(..., return_x0=True)` and subtracts `guide.correction(...) / max(1 - t, 0.001)` from $v$. The correction is pulled back to $x_t$ through `tiled_x0_vjp`, which runs `torch.func.functional_call` over a per-call detached clone of the network parameters and precomputed text preamble, one tile at a time, so activations are never held for the whole canvas.
 
 ---

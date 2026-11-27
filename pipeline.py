@@ -9,9 +9,9 @@ from torch.func import functional_call
 import torch.nn.functional as F
 
 try:
-    from .temporal import anchor_x0_velocity, compute_optical_flow, warp_noise_sequence
+    from .temporal import anchor_x0_velocity, compute_optical_flow, temporal_bilateral_stabilize, warp_noise_sequence
 except ImportError:
-    from temporal import anchor_x0_velocity, compute_optical_flow, warp_noise_sequence
+    from temporal import anchor_x0_velocity, compute_optical_flow, temporal_bilateral_stabilize, warp_noise_sequence
 
 
 def modulate(x, shift, scale):
@@ -746,6 +746,8 @@ class DiffusionModel(nn.Module):
             if bwd_flows is not None:
                 v = anchor_x0_velocity(x, v, t_cur, i, self.cfg.n_T, bwd_flows, occ_masks, flow_strength)
             x = x + (t_next - t_cur)[:, None, None, None] * v
+        if bwd_flows is not None:
+            x = temporal_bilateral_stabilize(x, bwd_flows, occ_masks, flow_strength)
         return x
 
 

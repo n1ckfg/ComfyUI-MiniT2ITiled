@@ -291,3 +291,39 @@ def anchor_x0_velocity(
 
     delta_v = (x0_anchored - x0_cfg) / remaining
     return v + delta_v.to(v.dtype)
+
+
+def temporal_bilateral_stabilize(
+    frames: torch.Tensor,
+    bwd_flows: torch.Tensor,
+    occ_masks: torch.Tensor,
+    strength: float,
+    sigma_r: float = 0.12,
+    max_blend: float = 0.4,
+) -> torch.Tensor:
+    """Post-sampling motion-compensated bilateral temporal filter for frames (B, C, H, W) in [-1, 1].
+
+    Damps residual high-frequency pixel shimmer on non-occluded pixels where the flow-warped
+    previous frame closely agrees in color, while rejecting large differences to avoid ghosting
+    or edge blur.
+    """
+    s = min(max(float(strength), 0.0), 1.0)
+    b = frames.shape[0]
+    if s <= 0.0 or b <= 1:
+        return frames
+
+    orig_dtype = frames.dtype
+    out = frames.float().clone()
+    inv_2sigma2 = 1.0 / (2.0 * sigma_r * sigma_r)
+    alpha = max_blend * s
+
+    for f in range(1, b):
+        warped_prev = warp_image(out[f - 1 : f], bwd_flows[f - 1 : f])
+        curr = out[f : f + 1]
+        diff_sq = (curr - warped_prev).pow(2).mean(dim=1, keepdim=True)
+        range_w = torch.exp(-diff_sq * inv_2sigma2)
+        w = alpha * occ_masks[f - 1 : f] * range_w
+        out[f : f + 1] = curr + w * (warped_prev - curr)
+
+    return out.to(orig_dtype)
+
