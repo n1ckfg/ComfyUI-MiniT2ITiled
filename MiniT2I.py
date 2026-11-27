@@ -153,6 +153,9 @@ class MiniT2ISampler(io.ComfyNode):
                 io.Image.Input("image", optional=True, tooltip="Input image for image to image. Images larger than 512x512 are sampled in overlapping 512x512 tiles at their own size."),
                 io.Int.Input("tile_overlap", default=64, min=0, max=256, step=8, tooltip="Overlap in pixels between 512x512 tiles when the image is larger than 512x512."),
                 io.Int.Input("tile_batch_size", default=4, min=1, max=64, step=1, tooltip="Maximum number of 512x512 tiles to evaluate in parallel per batch. Higher is faster on large images but uses more VRAM."),
+                io.Float.Input("temporal_consistency", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Cross-frame self-attention strength across multi-frame batches (attends to anchor and previous frame). Reduces color/style flicker. 0 disables."),
+                io.Float.Input("shared_noise", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Correlates initial noise across frames (0 = independent, 1 = shared). Automatically warps noise along optical flow when flow_consistency > 0 to avoid screen-door artifacts."),
+                io.Float.Input("flow_consistency", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Optical-flow temporal locking for multi-frame image batches: warps shared noise along motion and anchors early-step x0 predictions across frames (fading out before final sharpening). 0 disables."),
                 MiniT2IControlType.Input("control", optional=True, tooltip="Use MiniT2I Control"),
             ],
             outputs=[
@@ -181,7 +184,7 @@ class MiniT2ISampler(io.ComfyNode):
 
 
     @classmethod
-    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, tile_batch_size=4, image=None, control=None) -> io.NodeOutput:
+    def execute(cls, prompt, steps, guidance, model, text_encoder, seed, denoise, tile_overlap, tile_batch_size=4, temporal_consistency=0.0, shared_noise=0.0, flow_consistency=0.0, image=None, control=None) -> io.NodeOutput:
         torch.manual_seed(seed)
 
         transformer = model.model.module
@@ -252,6 +255,9 @@ class MiniT2ISampler(io.ComfyNode):
             denoise=denoise,
             tile_overlap=tile_overlap,
             tile_batch_size=tile_batch_size,
+            temporal_consistency=temporal_consistency,
+            shared_noise=shared_noise,
+            flow_consistency=flow_consistency,
             callback=callback,
             guide=guide,
             prompt_embeds=(text_emb, attn_mask),
