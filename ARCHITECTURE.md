@@ -12,7 +12,7 @@
 | `MiniT2I.py` | ComfyUI node definitions (`MiniT2ITextEncoder`, `MiniT2ILoader`, `MiniT2ISampler`, `MiniT2IControl`), the `MiniT2IModule` wrapper and `ModelPatcher` integration. |
 | `pipeline.py` | Self-contained model implementation (`MMJiT`, `DiffusionModel` with tiling and guidance hooks), Diffusers wrappers (`MiniT2IMMJiTModel`, `MiniT2IFlowMatchScheduler`), and inference pipelines (`MiniT2ITextToImagePipeline`, `MiniT2IPipeline`). |
 | `control.py` | Control losses (`EdgeControl`, `DepthControl`, `NormalControl`) and the `Guide` that turns them into a sampling correction. |
-| `temporal.py` | Optical-flow estimation (OpenCV DIS with pure-PyTorch multi-scale Lucas-Kanade fallback), forward-backward occlusion masks, variance-preserving 2× sub-pixel noise warping, early-step $x_0$ velocity anchoring, and post-sampling motion-compensated bilateral stabilization. |
+| `temporal.py` | Optical-flow estimation (OpenCV DIS with pure-PyTorch multi-scale Lucas-Kanade fallback), forward-backward occlusion masks, per-tile flow grids for temporal attention, variance-preserving 2× sub-pixel noise warping, early-step $x_0$ anchoring, and post-sampling motion-compensated bilateral stabilization. |
 | `example_workflows/MiniT2I_example.json` | Reference text-to-image workflow connecting the loaders, sampler, and `PreviewImage`. |
 | `pyproject.toml` | Package metadata and Comfy Registry (`[tool.comfy]`) configuration. |
 | `.github/workflows/publish.yml` | Publishes the pack to the Comfy Registry. |
@@ -40,7 +40,7 @@ flowchart LR
         G["control.Guide<br/>(gradient correction)"]
     end
 
-    OUT["ComfyUI IMAGE<br/>(B, H, W, C) float16 [0, 1]"]
+    OUT["ComfyUI IMAGE<br/>(B, H, W, C) float32 [0, 1]"]
 
     L1 -->|"ModelPatcher(MiniT2IModule(MiniT2IMMJiTModel))"| S1
     L2 -->|"ModelPatcher(MiniT2IModule(T5EncoderModel, tokenizer))"| S1
@@ -49,7 +49,7 @@ flowchart LR
     S1 --> S2
     S2 --> S3
     S3 -->|"text embeddings + attn_mask"| S4
-    S4 <-->|"x0 prediction → velocity"| S5
+    S4 <-->|"x0 prediction (CFG in x0)"| S5
     G <-->|"loss on x0, VJP through MMJiT"| S4
     S4 -->|"[-1, 1] → [0, 1] NHWC"| OUT
 ```
@@ -77,10 +77,10 @@ flowchart LR
   - `image` (`Image`): the control map. Edge: white lines on black (Canny, Lineart, HED). Depth: near = white. Normal: ControlNet/BAE convention.
   - `control_type` (`Combo`: `edge`, `depth`, `normal`)
   - `strength` (`Float`, default `0.4`, range `0.0–4.0`)
-  - `start` / `end` (`Float`, defaults `0.0` / `0.5`): the timestep window where guidance applies.
+  - `start` / `end` (`Float`, defaults `0.0` / `0.5`): the sampling-progress window where guidance applies (`0` = first step, `1` = last), independent of `denoise`.
   - `control` (`MINIT2I_CONTROL`, optional): a previous control to chain.
 - **Outputs:** `MINIT2I_CONTROL`, a custom `io.Custom("MINIT2I_CONTROL")` type holding a list of dicts (`type`, `image`, `strength`, `start`, `end`, and `depth_model` for depth/normal).
-- **Behavior:** Appends one entry to the incoming list. For `depth` and `normal` it loads `depth_anything_3_small.safetensors` from the `geometry_estimation` model folder via `comfy.sd.load_diffusion_model`.
+- **Behavior:** Appends one entry to the incoming list. For `depth` and `normal` it loads `depth_anything_3_small.safetensors` from the `geometry_estimation` model folder via `comfy.sd.load_diffusion_model`. The depth model is used to estimate the depth of the image being generated.
 
 ### `MiniT2ISampler` (`node_id="MiniT2I"`, `MiniT2I Sampler`)
 - **Inputs:**
@@ -97,15 +97,18 @@ flowchart LR
   - `temporal_consistency` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`)
   - `shared_noise` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`)
   - `flow_consistency` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`)
+  - `width` / `height` (`Int`, default `512`, range `512–16384`, step `8`): the canvas size when no `image` is connected.
+  - `global_structure` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`): weight of the pooled whole-canvas pass (see *Global structure* below).
   - `control` (`MINIT2I_CONTROL`, optional)
+  - New inputs are appended after the existing widgets, so saved workflows keep their widget values.
 - **Outputs:** `IMAGE`
 - **Behavior:**
-  1. Seeds PyTorch via `torch.manual_seed(seed)`; sampling noise comes from the global RNG.
+  1. Creates a CPU `torch.Generator().manual_seed(seed)`. All sampling noise is drawn from it on the CPU and then moved to the device, so a seed gives the same noise on CPU, CUDA and MPS.
   2. Calls `mm.load_models_gpu` on the transformer, the text encoder, and any depth models in `control`.
-  3. With an `image`: drops alpha, converts to NCHW, upscales bilinearly (`comfy.utils.common_upscale`) so the short side is at least `image_size` (512), rescales to `[-1, 1]`, and casts to the transformer's device and dtype. The image batch size becomes `num_images_per_prompt`.
-  4. With `control`: builds a `control.Guide` at the canvas size (the image size, or 512 × 512 without an image).
+  3. With an `image`: drops alpha, converts to NCHW, upscales bilinearly (`comfy.utils.common_upscale`) so the short side is at least `image_size` (512), rescales to `[-1, 1]`, and moves to the transformer's device as `float32`. The image sets the canvas size, overriding `width` / `height`, and its batch size becomes `num_images_per_prompt`.
+  4. With `control`: builds a `control.Guide` at the canvas size.
   5. Creates a `comfy.utils.ProgressBar`. Its callback checks `mm.throw_exception_if_processing_interrupted()` and updates the bar after each tile batch evaluation.
-  6. Runs `MiniT2IPipeline()(prompt, transformer, text_encoder, tokenizer, model_dir=transformer.config._name_or_path.parent, ...)` with `output_type="pt"` and returns `output.images`.
+  6. Runs `MiniT2IPipeline()(prompt, transformer, text_encoder, tokenizer, model_dir=transformer.config._name_or_path.parent, ...)` with `output_type="pt"`. It returns `output.images` on `mm.intermediate_device()` in `mm.intermediate_dtype()`.
 
 ---
 
@@ -133,21 +136,45 @@ Default (`b16`) configuration:
 4. **Joint Multimodal Backbone (`DoubleStreamDiTBlock` × `depth_double`):**
    - Dual-stream blocks with separate norms, QKV projections, output projections, and `SwiGLUMlp`s for image and text streams.
    - Shared Q/K `RMSNorm` and joint attention over concatenated `[txt, img]` sequences using `MultiModalRotaryEmbeddingFast` (1D RoPE on text tokens, 2D RoPE via `VisionRotaryEmbeddingFast` on the square image token grid).
-   - Attention is computed with `torch.nn.functional.scaled_dot_product_attention`. When `temporal_consistency > 0` on multi-frame batches (`B > 1`), cross-frame attention runs on all blocks except the final `min(3, depth // 4)` high-frequency blocks and cosine-tapers to `0` by 70% sampling progress. Frame `f - 1`'s pre-RoPE K/V tokens are warped on the `32 × 32` patch grid via `temporal.build_tile_flow_grids` (when `flow_consistency > 0`) before applying 2D RoPE so attention tracks motion rather than screen position; the unwarped frame-`0` anchor is included at 20% of the cross-frame weight (vs. 80% for `prev`) only during the first 40% of steps to stabilize global palette without stamping frame-0 spatial textures. All weights conserve total image-vs-text softmax mass and preserve exact identity on frame `0`.
+   - Attention is computed with `torch.nn.functional.scaled_dot_product_attention`. When `temporal_consistency > 0` on multi-frame batches (`B > 1`), cross-frame attention runs on all blocks except the final `min(3, depth // 4)` high-frequency blocks and cosine-tapers to `0` by 70% sampling progress. Frame `f - 1`'s pre-RoPE K/V tokens are warped on the `32 × 32` patch grid via `temporal.build_tile_flow_grids` (when `flow_consistency > 0`) before applying 2D RoPE so attention tracks motion rather than screen position; the unwarped frame-`0` anchor is included at 20% of the cross-frame weight (vs. 80% for `prev`) only during the first 40% of steps to stabilize global palette without stamping frame-0 spatial textures. Each warped `prev` token's weight is scaled by the confidence in the third channel of the flow grid: forward-backward visibility × "the source lies inside the tile". The weight it loses goes back to the current frame, so disoccluded regions don't attend to unrelated content. All weights conserve total image-vs-text softmax mass and preserve exact identity on frame `0`.
 5. **Output Head (`FinalLayer` + `unpatchify`):**
    - Applies `RMSNorm` and a linear projection to `patch_size * patch_size * out_channels` directly on the image tokens, and reshapes back to `(B, 3, H, W)`.
 
 ### Flow Matching & Sampling (`DiffusionModel`)
 Time runs from $t = 0$ (noise) to $t = 1$ (clean image).
-- **x-Prediction to Velocity (`pred_velocity`):** Predicts the clean image $x_0 = \text{MMJiT}(x_t, t, \text{text}, \text{mask})$ and derives velocity:
+- **x-Prediction:** The network predicts the clean image $x_0 = \text{MMJiT}(x_t, t, \text{text}, \text{mask})$. The implied velocity is
   $$v = \frac{x_0 - x_t}{\max(1 - t,\; 0.001)}$$
-- **Classifier-Free Guidance (`cfg_velocity`):** Concatenates conditional (`mask`) and unconditional (`zeros_like(mask)`) batches into a single forward pass and applies `uncond + (cond - uncond) * cfg_scale` for timesteps inside `cfg_interval`.
-- **Tiling (`tile_starts`, `tile_weights`, `tiled_cfg_velocity`):** The canvas is covered by `image_size × image_size` tiles spread evenly so neighbours overlap by at least `tile_overlap` pixels. Each tile gets a separable linear-ramp window, normalized so the windows sum to 1 at every pixel. Tiles are evaluated in balanced batches of up to `max(1, tile_batch_size // B)` tiles per forward pass (with OOM-adaptive batch halving) and blended back with `addcmul_`. A 512 × 512 canvas takes a direct single-tile fast path with no blending buffer.
+  Since $v$ is affine in $x_0$ at a fixed $x_t$ and $t$, CFG, tile blending and the guidance correction all act on $x_0$ directly.
+- **Classifier-Free Guidance (`_cfg_x0`):** Runs conditional (`mask`) and unconditional (`zeros_like(mask)`) inputs in one forward pass and returns `lerp(x0_uncond, x0_cond, cfg_scale)` (identical to CFG on $v$), plus `x0_cond` for guidance. The unconditional half is skipped when `guidance == 1.0` or $t$ is outside `cfg_interval`.
+- **Tiling (`tile_starts`, `tile_weights`, `tiled_x0`):**
+  - The canvas is covered by `image_size × image_size` tiles spread evenly, so neighbours overlap by at least `tile_overlap` pixels.
+  - Each tile gets a separable linear-ramp window, normalized so the windows sum to 1 at every pixel.
+  - Tiles are evaluated in balanced batches of up to `max(1, tile_batch_size // B)` tiles per forward pass, halving the batch on OOM.
+  - The canvas state, the windows and the blend accumulator are `float32`. Only the tile inputs are cast to the transformer dtype.
+  - A 512 × 512 canvas takes a direct single-tile fast path with no blending buffer.
+- **Global structure (`add_global_x0`):** Independent 512 × 512 tiles each compose their own scene (for example a grid of separate subjects at 4K). When `global_structure > 0` and the short side is at least `2 × image_size`, each step also runs a pooled whole-canvas pass:
+  - $x_t$ is average-pooled by $f = \lfloor \min(H, W) / 512 \rfloor$ and scaled by $a = 1 / (t + (1 - t)/f)$. Pooling divides the i.i.d. noise std by $f$, so the result is a valid state at time $a \cdot t$.
+  - That state is sampled with `tiled_x0` (same CFG and cross-frame attention, without flow grids).
+  - The low frequencies of the full-resolution $x_0$ are replaced: $x_0 \mathrel{+}= w \cdot \text{up}(x_0^\text{small} - \text{pool}_f(x_0))$.
+  - $w$ = `global_structure` for the first half of sampling, then cosine-fades to `0` by 90% progress. Ending it earlier lets tiles add their own extra subjects.
+  - Cost: 1080p (f = 2) pools to 960 × 540, which is 2 extra tiles over 8 (+23% time measured on MPS). 4K (f = 4) also pools to 960 × 540, which is 2 extra tiles over 40 (+8%).
 - **Image-to-Image:** `t_start = 1 - denoise`. With an input image the initial state is `lerp(noise, image, t_start)`.
-- **Euler Integrator (`sample`):** Initializes noise as `torch.randn(...) * 2` at the canvas size (optionally correlating noise across frames when `shared_noise > 0` and `B > 1` — using static shared noise if `flow_consistency == 0`, or 2× sub-pixel optical-flow-warped noise via `temporal.warp_noise_sequence` when `flow_consistency > 0`), precomputes the text preamble (`MMJiT.prepare_text`) once for conditional and unconditional conditioning, and integrates from $t_\text{start}$ to $1.0$ over `n_T` uniform Euler steps:
-  $$x_{t_{i+1}} = x_{t_i} + (t_{i+1} - t_i) \cdot v$$
-  When `flow_consistency > 0` on multi-frame image batches, `temporal.anchor_x0_velocity` additionally anchors early-step full-canvas $x_0$ predictions across consecutive frames along the backward optical flow (masked by forward-backward occlusion confidence and cosine-tapered to `0` at 65% progress so final steps sharpen cleanly), followed by a post-sampling motion-compensated bilateral filter (`temporal.temporal_bilateral_stabilize`) to damp residual high-frequency pixel shimmer without blurring moving edges.
-- **Control Guidance:** When a `Guide` is active at the current $t$, `sample` reuses the tiled conditional $x_0$ from `tiled_cfg_velocity(..., return_x0=True)` and subtracts `guide.correction(...) / max(1 - t, 0.001)` from $v$. The correction is pulled back to $x_t$ through `tiled_x0_vjp`, which runs `torch.func.functional_call` over a per-call detached clone of the network parameters and precomputed text preamble, one tile at a time, so activations are never held for the whole canvas.
+- **Noise:**
+  - Drawn on the CPU from `generator` and moved to the device, then scaled to `randn * 2` at the canvas size.
+  - With `shared_noise > 0` and `B > 1`, it is correlated across frames: static shared noise when `flow_consistency == 0`, or 2× sub-pixel optical-flow-warped noise via `temporal.warp_noise_sequence` when `flow_consistency > 0` on an image batch.
+- **Euler Integrator (`sample`):**
+  - The text preamble (`MMJiT.prepare_text`) is precomputed once each for conditional and unconditional conditioning.
+  - Integrates from $t_\text{start}$ to $1.0$ over `n_T` uniform steps, with $t_i$ as Python floats. Each step is $x \leftarrow \text{lerp}(x, x_0, (t_{i+1} - t_i) / \max(1 - t_i, 0.001))$, i.e. $x + (t_{i+1} - t_i) \cdot v$.
+  - When `flow_consistency > 0` on multi-frame image batches, `temporal.anchor_x0` blends each frame's $x_0$ toward the previous frame's, warped along the backward optical flow. The blend is masked by the occlusion confidence and cosine-tapered to `0` at 65% progress so the final steps sharpen cleanly.
+  - After sampling, a motion-compensated bilateral filter (`temporal.temporal_bilateral_stabilize`) damps residual high-frequency shimmer without blurring moving edges.
+- **Optical flow:**
+  - `compute_optical_flow` estimates flow on the CPU with the long side at most 1024 and keeps flows and occlusion masks at that resolution (flow values in canvas pixels).
+  - `frame_flow` upsamples one frame pair at a time to canvas size, so a 4K clip doesn't hold full-resolution flow for every frame.
+  - `warp_noise_sequence` writes frames into one preallocated output. A 4K warp now peaks at about +3 GiB (was +5–7 GiB).
+- **Control Guidance:**
+  - When a `Guide` is active at the current sampling progress (`i / n_T`), `sample` sets $x_0 \leftarrow x_0 - \text{guide.correction}(x_0^\text{cond}, \ldots)$. This equals subtracting `correction / max(1 - t, 0.001)` from $v$.
+  - The correction is pulled back to $x_t$ through `tiled_x0_vjp`. It runs `torch.func.functional_call` over a per-call detached clone of the network parameters and the precomputed text preamble.
+  - The VJP goes one tile and one frame at a time, without cross-frame attention, so activations are never held for the whole canvas or clip.
 
 ---
 
@@ -158,7 +185,7 @@ Control is training-free gradient guidance on the model's $x_0$ prediction; ther
 - **`EdgeControl`:** Grayscale, 4× downscale (Gaussian blur + stride, which also differentiates on MPS), Sobel magnitude, blur (`σ = 1.5`). The loss is the negative Pearson correlation with the blurred target edge map. Comparing at reduced resolution moves shapes instead of drawing lines.
 - **`DepthControl`:** Runs Depth Anything 3 (`comfy.ldm.depth_anything_3`) on the $x_0$ prediction at `compute_target_size(..., 504)` with ImageNet normalization, via `functional_call` on cloned parameters. The loss is the negative correlation of `-depth` with the target, so it ignores the target's depth scale and offset.
 - **`NormalControl`:** Uses the same depth estimate and compares the Sobel slopes of the blurred `-depth` with the target's R/G channels (mapped to `[-1, 1]`, blurred `σ = 2`).
-- **`Guide`:** Resizes each control map to the canvas, builds its control class under `torch.inference_mode(False)`, and is active when any control's `[start, end]` window contains $t$. `correction()`:
+- **`Guide`:** Resizes each control map to the canvas, builds its control class under `torch.inference_mode(False)`, and is active when any control's `[start, end]` window contains the sampling progress. `correction()`:
   1. Differentiates each active loss at the float32 $x_0$ and normalizes the gradient by its RMS times `strength`.
   2. Pulls the summed gradient back to $x_t$ with the model VJP.
   3. Averages it over channels, so guidance moves brightness rather than hue, and rescales it to the RMS of the $x_0$ gradient.
@@ -173,14 +200,13 @@ Control is training-free gradient guidance on the model's $x_0$ prediction; ther
   - Tokenizes prompts with `padding="max_length"`, `truncation=True` and `max_length=prompt_length`, then encodes them.
   - Temporarily sets `cfg.n_T` to `num_inference_steps` and restores it in a `finally`.
   - Casts text embeddings and mask to the transformer dtype and calls `transformer.sample()` with the image, denoise, tiling, callback and guide arguments.
-  - `output_type="pt"` (used by ComfyUI): clamps to `[-1, 1]`, rescales to `[0, 1]`, permutes to `(B, H, W, C)`, and casts to `float16` on CPU.
+  - `output_type="pt"` (used by ComfyUI): clamps to `[-1, 1]`, rescales to `[0, 1]`, and permutes to `(B, H, W, C)`. The result stays `float32` on the sampling device; the node moves it to ComfyUI's intermediate device and dtype.
   - `output_type="pil"` / numpy: rescales to `uint8` `[0, 255]`.
   - Also has `from_pretrained()` / `save_pretrained()` for standalone use; the nodes don't call them.
 - **`MiniT2IPipeline`** (`DiffusionPipeline`): Facade used by the nodes.
   - Maps variant aliases (`MODEL_ALIASES`: `b16`/`base` → `minit2i-b-16`, `l16`/`large` → `minit2i-l-16`).
   - Selectively downloads model subdirectories via `huggingface_hub.snapshot_download` and exposes `load_transformer()` for `MiniT2ILoader`.
   - `__call__(prompt, transformer, text_encoder, tokenizer, model_dir, **kwargs)` builds a `MiniT2ITextToImagePipeline` with the scheduler from `model_dir / "scheduler"` and runs it.
-- **`build_transformer_from_checkpoint(ckpt_path)`**: Utility for loading raw `.pt` checkpoints (`{"config": ..., "state_dict": ...}`) into a `MiniT2IMMJiTModel`; the nodes don't use it.
 
 ---
 
@@ -188,17 +214,20 @@ Control is training-free gradient guidance on the model's $x_0$ prediction; ther
 
 - **Device & dtype:**
   - The transformer runs in `bfloat16` and the text encoder in `float32`. Embeddings are cast to the transformer dtype before sampling.
+  - The sampling state, tile blending, flow and noise are `float32`.
   - Guidance losses run in `float32`.
-  - `_encode_prompt` moves the text encoder to the transformer's device if they differ, outside `ModelPatcher`'s control.
+  - The sampler node encodes the prompt itself and passes `prompt_embeds`; `_encode_prompt` (which moves the text encoder to the transformer's device outside `ModelPatcher`'s control) only runs for standalone pipeline use.
 - **Optional Inputs in `MiniT2ISampler`:** `model` and `text_encoder` are declared `optional=True`, yet `execute()` dereferences both. Both loader nodes must be connected.
 - **`denoise` without an image:** the tooltip says it is only used with an image, but `sample` always starts at `t = 1 - denoise`. Values below 1 without an image start mid-schedule from pure noise.
 - **Attention & Caching:**
   - `PlainTextTransformerBlock` and `DoubleStreamDiTBlock` use `torch.nn.functional.scaled_dot_product_attention` (SDPA) instead of materialized `einsum` + `softmax`.
   - 2D sinusoidal positional embeddings and 1D/2D RoPE `cos`/`sin` tables are cached in memory (created outside `inference_mode` so autograd in `tiled_x0_vjp` works cleanly).
   - `MMJiT.prepare_text` runs `txt_embedder`, `pooled_embedder`, and `txt_preamble_blocks` once per `sample()` call (for conditional and unconditional inputs) and reuses the result across all steps, tile batches, and VJP passes.
-  - Loaded `ModelPatcher` instances for the transformer, text encoder, and Depth Anything 3 model, as well as the `MiniT2IFlowMatchScheduler` and the last 16 prompt embeddings, are cached in memory. On a prompt cache hit, the T5 text encoder does not need to be loaded onto GPU.
+  - Loader nodes build a new model on each execution. There are no module-level model caches: ComfyUI's node output cache reuses a loaded model while the graph is unchanged, and `ModelPatcher` / `mm` own VRAM.
+  - Only the `MiniT2IFlowMatchScheduler` and the last 16 prompt embeddings (keyed by prompt and `prompt_length`) persist across executions. On a prompt cache hit, the T5 text encoder does not need to be loaded onto the GPU.
 - **Cost per step:**
   - Each step evaluates tiles in balanced chunks of up to `max(1, tile_batch_size // B)` tiles, running one CFG pass (`2 × chunk × B` items) per chunk (or a single conditional pass when `guidance == 1.0` or outside `cfg_interval`).
-  - Guided steps reuse the conditional $x_0$ from the CFG pass and add one VJP (forward + backward) per tile sequentially, plus the control losses (a Depth Anything 3 forward/backward for depth and normal).
+  - With `global_structure`, steps before 90% progress also evaluate the pooled canvas's tiles.
+  - Guided steps reuse the conditional $x_0$ from the CFG pass and add one VJP (forward + backward) per tile and frame sequentially, plus the control losses (a Depth Anything 3 forward/backward for depth and normal).
 - **Hub access:** `MiniT2ILoader` and `MiniT2ITextEncoder` try `local_files_only=True` first and only hit the Hugging Face Hub if the weights are not cached locally.
-- **Conditioning Vector (`vec`):** `MMJiT.forward` computes `vec = t_vec + pooled_embedder(pooled_text)` and passes it to `DoubleStreamDiTBlock` and `FinalLayer`, which accept it without applying AdaLN modulation. `modulate()` is defined but unused.
+- **Conditioning Vector (`vec`):** `MMJiT.forward` computes `vec = t_vec + pooled_embedder(pooled_text)` and passes it to `DoubleStreamDiTBlock` and `FinalLayer`, which accept it without applying AdaLN modulation.

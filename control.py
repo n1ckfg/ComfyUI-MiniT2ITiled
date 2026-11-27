@@ -122,15 +122,16 @@ class Guide:
                     target = F.interpolate(target, size=(height, width), mode="bilinear", antialias=True)
                 self.controls.append(CONTROL_TYPES[c["type"]](c, target))
 
-    def active(self, t):
-        return any(c.start <= t <= c.end for c in self.controls)
+    # progress is the sampling progress in [0, 1), so start/end mean the same at every denoise.
+    def active(self, progress):
+        return any(c.start <= progress <= c.end for c in self.controls)
 
-    def correction(self, x0, t, vjp):
+    def correction(self, x0, progress, vjp):
         with torch.inference_mode(False), torch.enable_grad():
             x = x0.detach().clone().float().requires_grad_(True)
             grad_x0 = torch.zeros_like(x)
             for c in self.controls:
-                if c.start <= t <= c.end:
+                if c.start <= progress <= c.end:
                     grad, = torch.autograd.grad(c.loss(x).sum(), x)
                     grad_x0 += c.strength * grad / rms(grad)
             grad_xt = vjp(grad_x0.to(x0.dtype)).float()

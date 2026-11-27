@@ -99,30 +99,29 @@ def _calc_pair_flow_cv2(gray_a, gray_b, dis_estimator):
     return torch.from_numpy(flow).permute(2, 0, 1).unsqueeze(0).float()
 
 
-def compute_optical_flow(images: torch.Tensor, max_side: int = 512):
+def compute_optical_flow(images: torch.Tensor, max_side: int = 1024):
     """Compute backward optical flow (f -> f-1) and soft non-occlusion masks for consecutive frames.
 
+    Both are returned at the estimation resolution (long side at most max_side) so large canvases
+    don't keep full-resolution flow per frame; use frame_flow() to get one pair at canvas size.
+
     Args:
-        images: (B, 3, H, W) tensor in [-1, 1].
-        max_side: Maximum dimension used for flow estimation before upscaling to (H, W).
+        images: (B, 3, H, W) tensor in [-1, 1], B > 1.
+        max_side: Maximum dimension used for flow estimation.
 
     Returns:
-        bwd_flows: (B - 1, 2, H, W) float32 tensor in full-resolution pixel units (dx, dy).
-        occ_masks: (B - 1, 1, H, W) float32 tensor in [0, 1] (1 = visible in previous frame, 0 = disoccluded/OOB).
+        bwd_flows: (B - 1, 2, h, w) float32 tensor, (dx, dy) in canvas pixels.
+        occ_masks: (B - 1, 1, h, w) float32 tensor in [0, 1] (1 = visible in previous frame, 0 = disoccluded/OOB).
     """
     b, _, h, w = images.shape
     device = images.device
-    if b <= 1:
-        return (
-            torch.zeros(0, 2, h, w, device=device, dtype=torch.float32),
-            torch.zeros(0, 1, h, w, device=device, dtype=torch.float32),
-        )
 
     scale = min(1.0, max_side / max(h, w))
     fh = max(16, int(round(h * scale / 2.0)) * 2)
     fw = max(16, int(round(w * scale / 2.0)) * 2)
 
-    rgb = (images.detach().float() * 0.5 + 0.5).clamp(0.0, 1.0)
+    # Flow is estimated on the CPU; resizing there also avoids MPS's missing non-integer "area" downscale.
+    rgb = (images.detach().float().cpu() * 0.5 + 0.5).clamp(0.0, 1.0)
     gray = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
     if (fh, fw) != (h, w):
         gray = F.interpolate(gray, size=(fh, fw), mode="area")
@@ -132,7 +131,7 @@ def compute_optical_flow(images: torch.Tensor, max_side: int = 512):
     if use_cv2:
         if hasattr(cv2, "DISOpticalFlow_create"):
             dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-        gray_np = (gray[:, 0].cpu().numpy() * 255.0).round().astype(np.uint8)
+        gray_np = (gray[:, 0].numpy() * 255.0).round().astype(np.uint8)
 
     base_small = _make_base_grid(fh, fw, torch.device("cpu"))[None]
     bwd_list = []
@@ -143,10 +142,8 @@ def compute_optical_flow(images: torch.Tensor, max_side: int = 512):
             bwd = _calc_pair_flow_cv2(gray_np[f], gray_np[f - 1], dis)
             fwd = _calc_pair_flow_cv2(gray_np[f - 1], gray_np[f], dis)
         else:
-            s_cur = gray[f : f + 1].cpu()
-            s_prev = gray[f - 1 : f].cpu()
-            bwd = _pytorch_lk_flow(s_cur, s_prev)
-            fwd = _pytorch_lk_flow(s_prev, s_cur)
+            bwd = _pytorch_lk_flow(gray[f : f + 1], gray[f - 1 : f])
+            fwd = _pytorch_lk_flow(gray[f - 1 : f], gray[f : f + 1])
 
         # Forward-backward consistency error at frame f: ||F_{f->f-1}(p) + F_{f-1->f}(p + F_{f->f-1}(p))||_2
         warped_fwd = warp_image(fwd, bwd)
@@ -169,27 +166,26 @@ def compute_optical_flow(images: torch.Tensor, max_side: int = 512):
         bwd_list.append(bwd)
         occ_list.append(occ)
 
-    bwd_flows = torch.cat(bwd_list, dim=0).to(device)
-    occ_masks = torch.cat(occ_list, dim=0).to(device)
+    bwd_flows = torch.cat(bwd_list, dim=0)
+    bwd_flows[:, 0] *= w / fw
+    bwd_flows[:, 1] *= h / fh
+    return bwd_flows.to(device), torch.cat(occ_list, dim=0).to(device)
 
-    if (fh, fw) != (h, w):
-        bwd_flows = F.interpolate(bwd_flows, size=(h, w), mode="bilinear", align_corners=False)
-        bwd_flows[:, 0] *= w / fw
-        bwd_flows[:, 1] *= h / fh
-        occ_masks = F.interpolate(occ_masks, size=(h, w), mode="bilinear", align_corners=False).clamp(0.0, 1.0)
 
-    # Re-enforce strict full-res border mask
-    base_full = _make_base_grid(h, w, device)[None]
-    coords_full = base_full + bwd_flows
-    in_bounds_full = (
-        (coords_full[:, 0:1] >= 0.0)
-        & (coords_full[:, 0:1] <= w - 1.0)
-        & (coords_full[:, 1:2] >= 0.0)
-        & (coords_full[:, 1:2] <= h - 1.0)
-    ).float()
-    occ_masks = occ_masks * in_bounds_full
-
-    return bwd_flows, occ_masks
+def frame_flow(bwd_flows: torch.Tensor, occ_masks: torch.Tensor, pair: int, size):
+    """Backward flow (1, 2, H, W) and visibility (1, 1, H, W) from frame pair + 1 to frame pair at canvas size,
+    with pixels whose source lies outside the canvas marked not visible."""
+    h, w = size
+    flow = F.interpolate(bwd_flows[pair : pair + 1], size=size, mode="bilinear", align_corners=False)
+    occ = F.interpolate(occ_masks[pair : pair + 1], size=size, mode="bilinear", align_corners=False).clamp_(0.0, 1.0)
+    coords = _make_base_grid(h, w, flow.device)[None] + flow
+    in_bounds = (
+        (coords[:, 0:1] >= 0.0)
+        & (coords[:, 0:1] <= w - 1.0)
+        & (coords[:, 1:2] >= 0.0)
+        & (coords[:, 1:2] <= h - 1.0)
+    )
+    return flow, occ * in_bounds
 
 
 def warp_noise_sequence(
@@ -210,87 +206,74 @@ def warp_noise_sequence(
     - Sub-pixel motions (0.5 px) transport smoothly without bilinear variance loss.
     - Zoom-in collisions and disoccluded regions are refreshed with fresh i.i.d. N(0, 1) noise.
     - 2x2 average pooling * 2.0 produces exact unit-variance N(0, 1) canvas noise on every frame.
+    Noise is drawn on the CPU so a seed gives the same noise on every device.
     """
-    s = min(max(float(shared_noise), 0.0), 1.0)
     fh, fw = height * 2, width * 2
-    fine = torch.randn(1, channels, fh, fw, generator=generator, device=device, dtype=torch.float32)
-    frames = [F.avg_pool2d(fine, 2) * 2.0]
-
-    base_fine = _make_base_grid(fh, fw, device)  # (2, 2H, 2W)
     n_fine = fh * fw
 
+    def randn(*shape):
+        return torch.randn(*shape, generator=generator).to(device)
+
+    fine = randn(1, channels, fh, fw)
+    out = torch.empty(b, channels, height, width, device=device, dtype=dtype)
+    out[0] = F.avg_pool2d(fine, 2)[0] * 2.0
+    pos = torch.arange(n_fine, device=device, dtype=torch.int32)
+    xs = torch.arange(fw, device=device, dtype=torch.float32)
+    ys = torch.arange(fh, device=device, dtype=torch.float32)[:, None]
+
     for f in range(1, b):
-        flow_f = F.interpolate(bwd_flows[f - 1 : f].float(), size=(fh, fw), mode="bilinear", align_corners=False)[0] * 2.0
-        occ_f = F.interpolate(occ_masks[f - 1 : f].float(), size=(fh, fw), mode="bilinear", align_corners=False)[0, 0]
+        flow = F.interpolate(bwd_flows[f - 1 : f], size=(fh, fw), mode="bilinear", align_corners=False)[0].mul_(2.0)
+        visible = F.interpolate(occ_masks[f - 1 : f], size=(fh, fw), mode="bilinear", align_corners=False)[0, 0] > 0.5
+        sx = flow[0].add_(xs).round_()
+        sy = flow[1].add_(ys).round_()
+        valid = visible & (sx >= 0) & (sx < fw) & (sy >= 0) & (sy < fh)
+        src = (sy.long().clamp_(0, fh - 1) * fw + sx.long().clamp_(0, fw - 1)).flatten()
+        del flow, sx, sy, visible
 
-        sx = (base_fine[0] + flow_f[0]).round().long()
-        sy = (base_fine[1] + flow_f[1]).round().long()
-        valid = (occ_f > 0.5) & (sx >= 0) & (sx < fw) & (sy >= 0) & (sy < fh)
-        src_idx = (sy.clamp(0, fh - 1) * fw + sx.clamp(0, fw - 1)).reshape(-1)
-        flat_valid = valid.reshape(-1)
+        # Resolve zoom-in collisions: at most one valid output sub-pixel (the last one) inherits each source sub-pixel.
+        # The rest (collisions, disocclusions, out-of-frame sources) get fresh noise. A full frame is drawn so the
+        # random stream doesn't depend on the flow, which differs slightly between devices.
+        owner = torch.full((n_fine,), -1, device=device, dtype=torch.int32)
+        owner.scatter_reduce_(0, src, torch.where(valid.flatten(), pos, -1), reduce="amax")
+        keep = owner[src] == pos
+        del owner, valid
 
-        # Resolve zoom-in collisions: at most one output sub-pixel may inherit each source sub-pixel.
-        keep = torch.zeros(n_fine, dtype=torch.bool, device=device)
-        valid_pos = torch.nonzero(flat_valid, as_tuple=False).squeeze(1)
-        if valid_pos.numel() > 0:
-            owner = torch.full((n_fine,), -1, dtype=torch.long, device=device)
-            src_valid = src_idx[valid_pos]
-            owner[src_valid] = valid_pos
-            keep[valid_pos] = owner[src_valid] == valid_pos
+        warped = fine.flatten(2)[:, :, src]
+        del src
+        fresh = randn(1, channels, n_fine)
+        fine = torch.where(keep, warped, fresh, out=fresh).view(1, channels, fh, fw)
+        del warped, keep
 
-        fresh_fine = torch.randn(1, channels, fh, fw, generator=generator, device=device, dtype=torch.float32)
-        warped_fine = fine.reshape(1, channels, n_fine)[:, :, src_idx].reshape(1, channels, fh, fw)
-        fine = torch.where(keep.reshape(1, 1, fh, fw), warped_fine, fresh_fine)
+        coarse = F.avg_pool2d(fine, 2)[0] * 2.0
+        if shared_noise < 1.0:
+            coarse = math.sqrt(shared_noise) * coarse + math.sqrt(1.0 - shared_noise) * randn(channels, height, width)
+        out[f] = coarse
 
-        coarse = F.avg_pool2d(fine, 2) * 2.0
-        if s < 1.0:
-            fresh_coarse = torch.randn(1, channels, height, width, generator=generator, device=device, dtype=torch.float32)
-            coarse = math.sqrt(s) * coarse + math.sqrt(1.0 - s) * fresh_coarse
-        frames.append(coarse)
-
-    return torch.cat(frames, dim=0).to(dtype)
+    return out
 
 
-def anchor_x0_velocity(
-    x: torch.Tensor,
-    v: torch.Tensor,
-    t_cur: torch.Tensor,
+def anchor_x0(
+    x0: torch.Tensor,
     step_idx: int,
     num_steps: int,
     bwd_flows: torch.Tensor,
     occ_masks: torch.Tensor,
-    flow_consistency: float,
+    strength: float,
     end_progress: float = 0.65,
-) -> torch.Tensor:
-    """Anchor early-step CFG x0 predictions across consecutive frames along optical flow.
+):
+    """In place: pull each frame's early-step x0 prediction toward the flow-warped (already anchored) previous frame.
 
     Cosine-tapers strength to 0 at `end_progress` so later denoising steps sharpen crisp
     high-frequency details without accumulating bilinear warp blur.
     """
-    strength = min(max(float(flow_consistency), 0.0), 1.0)
-    b = x.shape[0]
-    if strength <= 0.0 or b <= 1:
-        return v
-    progress = step_idx / max(num_steps, 1)
+    progress = step_idx / num_steps
     if progress >= end_progress:
-        return v
-
-    decay = 0.5 * (1.0 + math.cos(math.pi * progress / end_progress))
-    alpha = 0.85 * strength * decay
-    if alpha <= 1e-4:
-        return v
-
-    remaining = torch.clamp(1.0 - t_cur.float(), min=0.001)[:, None, None, None]
-    x0_cfg = x.float() + remaining * v.float()
-    x0_anchored = x0_cfg.clone()
-
-    for f in range(1, b):
-        warped_prev = warp_image(x0_anchored[f - 1 : f], bwd_flows[f - 1 : f])
-        w = alpha * occ_masks[f - 1 : f]
-        x0_anchored[f : f + 1] = x0_anchored[f : f + 1] + w * (warped_prev - x0_anchored[f : f + 1])
-
-    delta_v = (x0_anchored - x0_cfg) / remaining
-    return v + delta_v.to(v.dtype)
+        return
+    alpha = 0.85 * strength * 0.5 * (1.0 + math.cos(math.pi * progress / end_progress))
+    size = x0.shape[-2:]
+    for f in range(1, x0.shape[0]):
+        flow, occ = frame_flow(bwd_flows, occ_masks, f - 1, size)
+        x0[f : f + 1].lerp_(warp_image(x0[f - 1 : f], flow), alpha * occ)
 
 
 def temporal_bilateral_stabilize(
@@ -300,55 +283,45 @@ def temporal_bilateral_stabilize(
     strength: float,
     sigma_r: float = 0.12,
     max_blend: float = 0.4,
-) -> torch.Tensor:
-    """Post-sampling motion-compensated bilateral temporal filter for frames (B, C, H, W) in [-1, 1].
+):
+    """In place: post-sampling motion-compensated bilateral temporal filter for frames (B, C, H, W) in [-1, 1].
 
     Damps residual high-frequency pixel shimmer on non-occluded pixels where the flow-warped
     previous frame closely agrees in color, while rejecting large differences to avoid ghosting
     or edge blur.
     """
-    s = min(max(float(strength), 0.0), 1.0)
-    b = frames.shape[0]
-    if s <= 0.0 or b <= 1:
-        return frames
-
-    orig_dtype = frames.dtype
-    out = frames.float().clone()
     inv_2sigma2 = 1.0 / (2.0 * sigma_r * sigma_r)
-    alpha = max_blend * s
-
-    for f in range(1, b):
-        warped_prev = warp_image(out[f - 1 : f], bwd_flows[f - 1 : f])
-        curr = out[f : f + 1]
-        diff_sq = (curr - warped_prev).pow(2).mean(dim=1, keepdim=True)
-        range_w = torch.exp(-diff_sq * inv_2sigma2)
-        w = alpha * occ_masks[f - 1 : f] * range_w
-        out[f : f + 1] = curr + w * (warped_prev - curr)
-
-    return out.to(orig_dtype)
+    size = frames.shape[-2:]
+    for f in range(1, frames.shape[0]):
+        flow, occ = frame_flow(bwd_flows, occ_masks, f - 1, size)
+        warped = warp_image(frames[f - 1 : f], flow)
+        curr = frames[f : f + 1]
+        range_w = torch.exp(-(curr - warped).pow(2).mean(dim=1, keepdim=True) * inv_2sigma2)
+        curr.lerp_(warped, max_blend * strength * occ * range_w)
 
 
 def build_tile_flow_grids(
     bwd_flows: torch.Tensor,
+    occ_masks: torch.Tensor,
+    size,
     tiles,
     tile_size: int,
     patch_size: int,
 ) -> torch.Tensor:
-    """Build normalized grid_sample coordinates (T, F - 1, side, side, 2) on each tile's patch grid
-    so frame (f - 1)'s pre-RoPE K/V tokens can be motion-warped into frame f's coordinates.
+    """Per-tile patch-grid data (T, F - 1, side, side, 3) for motion-warping frame (f - 1)'s pre-RoPE K/V tokens
+    into frame f's coordinates: normalized grid_sample x, y, and the warped token's confidence
+    (visible in frame f - 1 and sourced from inside the tile).
     """
     side = tile_size // patch_size
     base = _make_base_grid(side, side, bwd_flows.device)[None]  # (1, 2, side, side)
-    scale_x = 2.0 / max(side - 1, 1)
-    scale_y = 2.0 / max(side - 1, 1)
-    grids = []
-    for y, x0, _ in tiles:
-        tile_flow = bwd_flows[:, :, y:y + tile_size, x0:x0 + tile_size].float()
-        pflow = F.interpolate(tile_flow, size=(side, side), mode="area") / float(patch_size)
-        coords = base + pflow
-        gx = coords[:, 0] * scale_x - 1.0
-        gy = coords[:, 1] * scale_y - 1.0
-        grids.append(torch.stack([gx, gy], dim=-1))
-    return torch.stack(grids, dim=0)  # (T, F - 1, side, side, 2)
-
-
+    scale = 2.0 / (side - 1)
+    grids = torch.empty(len(tiles), bwd_flows.shape[0], side, side, 3, device=bwd_flows.device)
+    for f in range(bwd_flows.shape[0]):
+        flow, occ = frame_flow(bwd_flows, occ_masks, f, size)
+        for ti, (y, x0, _) in enumerate(tiles):
+            pflow = F.interpolate(flow[:, :, y:y + tile_size, x0:x0 + tile_size], size=(side, side), mode="area") / patch_size
+            grid = (base + pflow) * scale - 1.0
+            inside = (grid.abs() <= 1.0).all(dim=1)
+            grids[ti, f, ..., :2] = grid[0].permute(1, 2, 0)
+            grids[ti, f, ..., 2] = F.interpolate(occ[:, :, y:y + tile_size, x0:x0 + tile_size], size=(side, side), mode="area")[0, 0] * inside[0]
+    return grids

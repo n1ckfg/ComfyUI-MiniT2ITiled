@@ -11,7 +11,9 @@ Workflows are in the templates section.
 | l16 | 4.3GB |
 
 
-Models, schedulers, and recent prompt embeddings are cached in memory (managed via ComfyUI's `ModelPatcher` for VRAM offloading), and attention uses PyTorch's fused `scaled_dot_product_attention`.
+Models are managed by ComfyUI's `ModelPatcher` for VRAM offloading, recent prompt embeddings are cached in memory, and attention uses PyTorch's fused `scaled_dot_product_attention`.
+
+For text to image at 1080p and above, set `width`/`height` and use `global_structure` ≈ 1 so the 512×512 tiles share one composition.
 
 ### Changes
 
