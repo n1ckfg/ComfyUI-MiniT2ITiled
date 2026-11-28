@@ -97,7 +97,7 @@ flowchart LR
   - `temporal_consistency` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`)
   - `shared_noise` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`)
   - `flow_consistency` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`)
-  - `width` / `height` (`Int`, default `512`, range `512–16384`, step `8`): the canvas size when no `image` is connected.
+  - `width` / `height` (`Int`, default `512`, range `512–16384`, step `8`): the canvas size when no `image` is connected (falls back to the first `control` map's size if left at `512 × 512`).
   - `global_structure` (`Float`, default `0.0`, range `0.0–1.0`, step `0.05`): weight of the pooled whole-canvas pass (see *Global structure* below).
   - `control` (`MINIT2I_CONTROL`, optional)
   - New inputs are appended after the existing widgets, so saved workflows keep their widget values.
@@ -105,7 +105,7 @@ flowchart LR
 - **Behavior:**
   1. Creates a CPU `torch.Generator().manual_seed(seed)`. All sampling noise is drawn from it on the CPU and then moved to the device, so a seed gives the same noise on CPU, CUDA and MPS.
   2. Calls `mm.load_models_gpu` on the transformer, the text encoder, and any depth models in `control`.
-  3. With an `image`: drops alpha, converts to NCHW, upscales bilinearly (`comfy.utils.common_upscale`) so the short side is at least `image_size` (512), rescales to `[-1, 1]`, and moves to the transformer's device as `float32`. The image sets the canvas size, overriding `width` / `height`, and its batch size becomes `num_images_per_prompt`.
+  3. Infers `num_images_per_prompt` from the maximum batch size across `image` and `control` (validating that all inputs have batch size `1` or `num_images_per_prompt`). With an `image`: drops alpha, converts to NCHW, upscales bilinearly (`comfy.utils.common_upscale`) so the short side is at least `image_size` (512), rescales to `[-1, 1]`, and moves to the transformer's device as `float32`, overriding `width` / `height`. Without `image`, if `control` is connected and `width` / `height` are at their `512 × 512` defaults, the canvas adopts the first control map's size (upscaled so the short side is at least 512).
   4. With `control`: builds a `control.Guide` at the canvas size.
   5. Creates a `comfy.utils.ProgressBar`. Its callback checks `mm.throw_exception_if_processing_interrupted()` and updates the bar after each tile batch evaluation.
   6. Runs `MiniT2IPipeline()(prompt, transformer, text_encoder, tokenizer, model_dir=transformer.config._name_or_path.parent, ...)` with `output_type="pt"`. It returns `output.images` on `mm.intermediate_device()` in `mm.intermediate_dtype()`.
@@ -136,7 +136,10 @@ Default (`b16`) configuration:
 4. **Joint Multimodal Backbone (`DoubleStreamDiTBlock` × `depth_double`):**
    - Dual-stream blocks with separate norms, QKV projections, output projections, and `SwiGLUMlp`s for image and text streams.
    - Shared Q/K `RMSNorm` and joint attention over concatenated `[txt, img]` sequences using `MultiModalRotaryEmbeddingFast` (1D RoPE on text tokens, 2D RoPE via `VisionRotaryEmbeddingFast` on the square image token grid).
-   - Attention is computed with `torch.nn.functional.scaled_dot_product_attention`. When `temporal_consistency > 0` on multi-frame batches (`B > 1`), cross-frame attention runs on all blocks except the final `min(3, depth // 4)` high-frequency blocks and cosine-tapers to `0` by 70% sampling progress. Frame `f - 1`'s pre-RoPE K/V tokens are warped on the `32 × 32` patch grid via `temporal.build_tile_flow_grids` (when `flow_consistency > 0`) before applying 2D RoPE so attention tracks motion rather than screen position; the unwarped frame-`0` anchor is included at 20% of the cross-frame weight (vs. 80% for `prev`) only during the first 40% of steps to stabilize global palette without stamping frame-0 spatial textures. Each warped `prev` token's weight is scaled by the confidence in the third channel of the flow grid: forward-backward visibility × "the source lies inside the tile". The weight it loses goes back to the current frame, so disoccluded regions don't attend to unrelated content. All weights conserve total image-vs-text softmax mass and preserve exact identity on frame `0`.
+   - Attention is computed with `torch.nn.functional.scaled_dot_product_attention`. When `temporal_consistency > 0` on multi-frame batches (`B > 1`):
+     - Without optical flow, cross-frame attention runs on all blocks except the final `min(3, depth // 4)` blocks, cosine-tapers to `0` by 70% progress, and includes the unwarped frame-`0` anchor at 20% of cross-frame weight during the first 40% of steps.
+     - With optical flow (`flow_consistency > 0`), frame `f - 1`'s pre-RoPE K/V tokens are warped on the `32 × 32` patch grid via `temporal.build_tile_flow_grids` before applying 2D RoPE, the unwarped frame-`0` anchor is omitted, and cross-frame attention is limited to the first half of blocks (`max(1, depth // 2)`) and the first 45% of steps so it aligns global color/style without pinning sub-16px intra-patch textures to static screen coordinates.
+     - Each warped `prev` token's weight is scaled by the confidence in the third channel of the flow grid: forward-backward visibility × "the source lies inside the tile". The weight it loses goes back to the current frame, so disoccluded regions don't attend to unrelated content. All weights conserve total image-vs-text softmax mass and preserve exact identity on frame `0`.
 5. **Output Head (`FinalLayer` + `unpatchify`):**
    - Applies `RMSNorm` and a linear projection to `patch_size * patch_size * out_channels` directly on the image tokens, and reshapes back to `(B, 3, H, W)`.
 
@@ -154,23 +157,23 @@ Time runs from $t = 0$ (noise) to $t = 1$ (clean image).
   - A 512 × 512 canvas takes a direct single-tile fast path with no blending buffer.
 - **Global structure (`add_global_x0`):** Independent 512 × 512 tiles each compose their own scene (for example a grid of separate subjects at 4K). When `global_structure > 0` and the short side is at least `2 × image_size`, each step also runs a pooled whole-canvas pass:
   - $x_t$ is average-pooled by $f = \lfloor \min(H, W) / 512 \rfloor$ and scaled by $a = 1 / (t + (1 - t)/f)$. Pooling divides the i.i.d. noise std by $f$, so the result is a valid state at time $a \cdot t$.
-  - That state is sampled with `tiled_x0` (same CFG and cross-frame attention, without flow grids).
-  - The low frequencies of the full-resolution $x_0$ are replaced: $x_0 \mathrel{+}= w \cdot \text{up}(x_0^\text{small} - \text{pool}_f(x_0))$.
+  - That state is sampled with `tiled_x0` (same CFG, cross-frame attention, and downscaled flow grids when optical flow is active).
+  - The low frequencies of the full-resolution $x_0$ (and conditional $x_0^\text{cond}$ when distinct and needed by control guidance) are replaced: $x_0 \mathrel{+}= w \cdot \text{up}(x_0^\text{small} - \text{pool}_f(x_0))$.
   - $w$ = `global_structure` for the first half of sampling, then cosine-fades to `0` by 90% progress. Ending it earlier lets tiles add their own extra subjects.
-  - Cost: 1080p (f = 2) pools to 960 × 540, which is 2 extra tiles over 8 (+23% time measured on MPS). 4K (f = 4) also pools to 960 × 540, which is 2 extra tiles over 40 (+8%).
+  - Cost (at default `tile_overlap = 64`): 1080p (f = 2) pools to 960 × 540, which is 4 extra tiles over 15 (~+24% tile evaluations). 4K (f = 4) also pools to 960 × 540, which is 4 extra tiles over 45 (~+8% tile evaluations).
 - **Image-to-Image:** `t_start = 1 - denoise`. With an input image the initial state is `lerp(noise, image, t_start)`.
 - **Noise:**
   - Drawn on the CPU from `generator` and moved to the device, then scaled to `randn * 2` at the canvas size.
-  - With `shared_noise > 0` and `B > 1`, it is correlated across frames: static shared noise when `flow_consistency == 0`, or 2× sub-pixel optical-flow-warped noise via `temporal.warp_noise_sequence` when `flow_consistency > 0` on an image batch.
+  - With `B > 1`, noise is correlated across frames when `shared_noise > 0` or `flow_consistency > 0`: static shared noise when optical flow is inactive, or 2× sub-pixel optical-flow-warped noise via `temporal.warp_noise_sequence` at strength `max(shared_noise, flow_consistency)` when `flow_consistency > 0` on a multi-frame image batch.
 - **Euler Integrator (`sample`):**
   - The text preamble (`MMJiT.prepare_text`) is precomputed once each for conditional and unconditional conditioning.
   - Integrates from $t_\text{start}$ to $1.0$ over `n_T` uniform steps, with $t_i$ as Python floats. Each step is $x \leftarrow \text{lerp}(x, x_0, (t_{i+1} - t_i) / \max(1 - t_i, 0.001))$, i.e. $x + (t_{i+1} - t_i) \cdot v$.
-  - When `flow_consistency > 0` on multi-frame image batches, `temporal.anchor_x0` blends each frame's $x_0$ toward the previous frame's, warped along the backward optical flow. The blend is masked by the occlusion confidence and cosine-tapered to `0` at 65% progress so the final steps sharpen cleanly.
-  - After sampling, a motion-compensated bilateral filter (`temporal.temporal_bilateral_stabilize`) damps residual high-frequency shimmer without blurring moving edges.
+  - When `flow_consistency > 0` on multi-frame image batches, `temporal.anchor_x0` blends each frame's $x_0$ toward the previous frame's, bicubic-warped along the backward optical flow. The blend is masked by the occlusion confidence and cosine-tapered to `0` at 80% progress so moving textures carry cleanly across `16 × 16` patch boundaries while the final steps sharpen crisp grain.
+  - After sampling, a bicubic motion-compensated bilateral filter (`temporal.temporal_bilateral_stabilize`, `sigma_r = 0.08`, `max_blend = 0.35`) damps residual high-frequency shimmer without blurring moving grain or edges.
 - **Optical flow:**
-  - `compute_optical_flow` estimates flow on the CPU with the long side at most 1024 and keeps flows and occlusion masks at that resolution (flow values in canvas pixels).
+  - `compute_optical_flow` estimates flow on the CPU with OpenCV DIS (`finest_scale = 0`, long side at most 1024) and keeps flows and occlusion masks at that resolution (flow values in canvas pixels).
   - `frame_flow` upsamples one frame pair at a time to canvas size, so a 4K clip doesn't hold full-resolution flow for every frame.
-  - `warp_noise_sequence` writes frames into one preallocated output. A 4K warp now peaks at about +3 GiB (was +5–7 GiB).
+  - `warp_noise_sequence` tracks per-cell fractional rounding residuals across frames (preventing `< 0.25 px/frame` lockup and cumulative speed slip) and writes frames into one preallocated output.
 - **Control Guidance:**
   - When a `Guide` is active at the current sampling progress (`i / n_T`), `sample` sets $x_0 \leftarrow x_0 - \text{guide.correction}(x_0^\text{cond}, \ldots)$. This equals subtracting `correction / max(1 - t, 0.001)` from $v$.
   - The correction is pulled back to $x_t$ through `tiled_x0_vjp`. It runs `torch.func.functional_call` over a per-call detached clone of the network parameters and the precomputed text preamble.
@@ -185,8 +188,8 @@ Control is training-free gradient guidance on the model's $x_0$ prediction; ther
 - **`EdgeControl`:** Grayscale, 4× downscale (Gaussian blur + stride, which also differentiates on MPS), Sobel magnitude, blur (`σ = 1.5`). The loss is the negative Pearson correlation with the blurred target edge map. Comparing at reduced resolution moves shapes instead of drawing lines.
 - **`DepthControl`:** Runs Depth Anything 3 (`comfy.ldm.depth_anything_3`) on the $x_0$ prediction at `compute_target_size(..., 504)` with ImageNet normalization, via `functional_call` on cloned parameters. The loss is the negative correlation of `-depth` with the target, so it ignores the target's depth scale and offset.
 - **`NormalControl`:** Uses the same depth estimate and compares the Sobel slopes of the blurred `-depth` with the target's R/G channels (mapped to `[-1, 1]`, blurred `σ = 2`).
-- **`Guide`:** Resizes each control map to the canvas, builds its control class under `torch.inference_mode(False)`, and is active when any control's `[start, end]` window contains the sampling progress. `correction()`:
-  1. Differentiates each active loss at the float32 $x_0$ and normalizes the gradient by its RMS times `strength`.
+- **`Guide`:** Preprocesses each control map in small frame chunks to its target resolution under `torch.inference_mode(False)` (avoiding full-clip 4K GPU allocations), and is active when any control's `[start, end]` window contains the sampling progress. `correction()`:
+  1. Differentiates each active loss one frame at a time (`O(1)` autograd memory across frames, supporting `1`-frame static or `B`-frame animated control maps) at the float32 $x_0^\text{cond}$ and normalizes the gradient by its RMS times `strength`.
   2. Pulls the summed gradient back to $x_t$ with the model VJP.
   3. Averages it over channels, so guidance moves brightness rather than hue, and rescales it to the RMS of the $x_0$ gradient.
 

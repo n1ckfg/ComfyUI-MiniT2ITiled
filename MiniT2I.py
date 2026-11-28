@@ -120,10 +120,10 @@ class MiniT2ISampler(io.ComfyNode):
                 io.Int.Input("tile_overlap", default=64, min=0, max=256, step=8, tooltip="Overlap in pixels between 512x512 tiles when the image is larger than 512x512."),
                 io.Int.Input("tile_batch_size", default=4, min=1, max=64, step=1, tooltip="Maximum number of 512x512 tiles to evaluate in parallel per batch. Higher is faster on large images but uses more VRAM."),
                 io.Float.Input("temporal_consistency", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Cross-frame self-attention strength across multi-frame batches (attends to anchor and previous frame). Reduces color/style flicker. 0 disables."),
-                io.Float.Input("shared_noise", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Correlates initial noise across frames (0 = independent, 1 = shared). Automatically warps noise along optical flow when flow_consistency > 0 to avoid screen-door artifacts."),
-                io.Float.Input("flow_consistency", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Optical-flow temporal locking for multi-frame image batches: warps shared noise along motion and anchors early-step x0 predictions across frames (fading out before final sharpening). 0 disables."),
-                io.Int.Input("width", default=512, min=512, max=16384, step=8, tooltip="Canvas width when no image is connected. Larger canvases are sampled in overlapping 512x512 tiles."),
-                io.Int.Input("height", default=512, min=512, max=16384, step=8, tooltip="Canvas height when no image is connected."),
+                io.Float.Input("shared_noise", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Correlates initial noise across frames (0 = independent, 1 = shared). When flow_consistency > 0 on an image batch, noise is warped along optical flow at max(shared_noise, flow_consistency)."),
+                io.Float.Input("flow_consistency", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Optical-flow temporal locking for multi-frame image batches: warps noise along motion, guides cross-frame attention, and anchors early-step x0 predictions across frames (fading out before final sharpening). 0 disables."),
+                io.Int.Input("width", default=512, min=512, max=16384, step=8, tooltip="Canvas width when no image is connected (defaults to the first control map's size if left at 512x512). Larger canvases are sampled in overlapping 512x512 tiles."),
+                io.Int.Input("height", default=512, min=512, max=16384, step=8, tooltip="Canvas height when no image is connected (defaults to the first control map's size if left at 512x512)."),
                 io.Float.Input("global_structure", default=0.0, min=0.0, max=1.0, step=0.05, tooltip="Canvases at least 1024 on the short side: follows the composition of a downscaled whole-canvas pass (fading out late in sampling) so the 512x512 tiles don't each compose their own scene. Use about 1 for text to image or high denoise. 0 disables."),
                 MiniT2IControlType.Input("control", optional=True, tooltip="Use MiniT2I Control"),
             ],
@@ -164,9 +164,14 @@ class MiniT2ISampler(io.ComfyNode):
             if len(_PROMPT_CACHE) > _PROMPT_CACHE_MAX:
                 _PROMPT_CACHE.popitem(last=False)
 
-        num_images = 1
+        size = transformer.mmjit_config.image_size
+        batch_sizes = ([image.shape[0]] if image is not None else []) + [c["image"].shape[0] for c in (control or [])]
+        num_images = max(batch_sizes, default=1)
+        for bs in batch_sizes:
+            if bs not in (1, num_images):
+                raise ValueError(f"Incompatible batch sizes across image and control inputs: {batch_sizes}")
+
         if image is not None:
-            size = transformer.mmjit_config.image_size
             image = image[..., :3].movedim(-1, 1)
             height, width = image.shape[-2:]
             if min(height, width) < size:
@@ -174,7 +179,11 @@ class MiniT2ISampler(io.ComfyNode):
                 image = comfy.utils.common_upscale(image, max(size, round(width * scale)), max(size, round(height * scale)), "bilinear", "disabled")
                 height, width = image.shape[-2:]
             image = (image * 2 - 1).to(transformer.device, torch.float32)
-            num_images = image.shape[0]
+        elif control and (width, height) == (size, size):
+            height, width = control[0]["image"].shape[1:3]
+            if min(height, width) < size:
+                scale = size / min(height, width)
+                width, height = max(size, round(width * scale)), max(size, round(height * scale))
 
         if num_images > 1:
             text_emb = text_emb.expand(num_images, -1, -1)

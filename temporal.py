@@ -18,7 +18,7 @@ def _make_base_grid(height: int, width: int, device: torch.device) -> torch.Tens
     return torch.stack([grid_x, grid_y], dim=0)  # (2, H, W)
 
 
-def warp_image(src: torch.Tensor, bwd_flow: torch.Tensor) -> torch.Tensor:
+def warp_image(src: torch.Tensor, bwd_flow: torch.Tensor, mode: str = "bilinear") -> torch.Tensor:
     """Warp src (N, C, H, W) using backward optical flow bwd_flow (N, 2, H, W) in pixel units."""
     orig_dtype = src.dtype
     src_f = src.float()
@@ -29,7 +29,16 @@ def warp_image(src: torch.Tensor, bwd_flow: torch.Tensor) -> torch.Tensor:
     gx = coords[:, 0] * (2.0 / max(w - 1, 1)) - 1.0
     gy = coords[:, 1] * (2.0 / max(h - 1, 1)) - 1.0
     grid = torch.stack([gx, gy], dim=-1)  # (N, H, W, 2)
-    warped = F.grid_sample(src_f, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    if mode == "bicubic":
+        try:
+            warped = F.grid_sample(src_f, grid, mode="bicubic", padding_mode="border", align_corners=True)
+        except (NotImplementedError, RuntimeError):
+            warped = F.grid_sample(src_f.cpu(), grid.cpu(), mode="bicubic", padding_mode="border", align_corners=True).to(src.device)
+        lo = src_f.amin(dim=(-2, -1), keepdim=True)
+        hi = src_f.amax(dim=(-2, -1), keepdim=True)
+        warped = warped.clamp(lo, hi)
+    else:
+        warped = F.grid_sample(src_f, grid, mode=mode, padding_mode="border", align_corners=True)
     return warped.to(orig_dtype)
 
 
@@ -131,6 +140,7 @@ def compute_optical_flow(images: torch.Tensor, max_side: int = 1024):
     if use_cv2:
         if hasattr(cv2, "DISOpticalFlow_create"):
             dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+            dis.setFinestScale(0)
         gray_np = (gray[:, 0].numpy() * 255.0).round().astype(np.uint8)
 
     base_small = _make_base_grid(fh, fw, torch.device("cpu"))[None]
@@ -220,12 +230,26 @@ def warp_noise_sequence(
     pos = torch.arange(n_fine, device=device, dtype=torch.int32)
     xs = torch.arange(fw, device=device, dtype=torch.float32)
     ys = torch.arange(fh, device=device, dtype=torch.float32)[:, None]
+    # Track per-cell fractional rounding residuals across frames so slow (<0.25 px/frame)
+    # and non-0.5-multiple motions accumulate without locking to screen coordinates or slipping.
+    rem_x = torch.zeros(fh, fw, device=device, dtype=torch.float32)
+    rem_y = torch.zeros(fh, fw, device=device, dtype=torch.float32)
 
     for f in range(1, b):
         flow = F.interpolate(bwd_flows[f - 1 : f], size=(fh, fw), mode="bilinear", align_corners=False)[0].mul_(2.0)
         visible = F.interpolate(occ_masks[f - 1 : f], size=(fh, fw), mode="bilinear", align_corners=False)[0, 0] > 0.5
-        sx = flow[0].add_(xs).round_()
-        sy = flow[1].add_(ys).round_()
+        approx_x = (xs + flow[0]).round_().long().clamp_(0, fw - 1)
+        approx_y = (ys + flow[1]).round_().long().clamp_(0, fh - 1)
+        approx_src = (approx_y * fw + approx_x).flatten()
+        total_dx = flow[0].add_(rem_x.flatten()[approx_src].view(fh, fw))
+        total_dy = flow[1].add_(rem_y.flatten()[approx_src].view(fh, fw))
+        del approx_x, approx_y, approx_src
+        step_dx = total_dx.round()
+        step_dy = total_dy.round()
+        new_rem_x = total_dx.sub_(step_dx)
+        new_rem_y = total_dy.sub_(step_dy)
+        sx = step_dx.add_(xs)
+        sy = step_dy.add_(ys)
         valid = visible & (sx >= 0) & (sx < fw) & (sy >= 0) & (sy < fh)
         src = (sy.long().clamp_(0, fh - 1) * fw + sx.long().clamp_(0, fw - 1)).flatten()
         del flow, sx, sy, visible
@@ -242,7 +266,10 @@ def warp_noise_sequence(
         del src
         fresh = randn(1, channels, n_fine)
         fine = torch.where(keep, warped, fresh, out=fresh).view(1, channels, fh, fw)
-        del warped, keep
+        keep_2d = keep.view(fh, fw)
+        rem_x = torch.where(keep_2d, new_rem_x, torch.zeros_like(new_rem_x))
+        rem_y = torch.where(keep_2d, new_rem_y, torch.zeros_like(new_rem_y))
+        del warped, keep, keep_2d, new_rem_x, new_rem_y
 
         coarse = F.avg_pool2d(fine, 2)[0] * 2.0
         if shared_noise < 1.0:
@@ -259,12 +286,12 @@ def anchor_x0(
     bwd_flows: torch.Tensor,
     occ_masks: torch.Tensor,
     strength: float,
-    end_progress: float = 0.65,
+    end_progress: float = 0.80,
 ):
-    """In place: pull each frame's early-step x0 prediction toward the flow-warped (already anchored) previous frame.
+    """In place: pull each frame's x0 prediction toward the bicubic flow-warped (already anchored) previous frame.
 
     Cosine-tapers strength to 0 at `end_progress` so later denoising steps sharpen crisp
-    high-frequency details without accumulating bilinear warp blur.
+    high-frequency details while carrying moving textures cleanly across 16x16 patch boundaries.
     """
     progress = step_idx / num_steps
     if progress >= end_progress:
@@ -273,7 +300,7 @@ def anchor_x0(
     size = x0.shape[-2:]
     for f in range(1, x0.shape[0]):
         flow, occ = frame_flow(bwd_flows, occ_masks, f - 1, size)
-        x0[f : f + 1].lerp_(warp_image(x0[f - 1 : f], flow), alpha * occ)
+        x0[f : f + 1].lerp_(warp_image(x0[f - 1 : f], flow, mode="bicubic"), alpha * occ)
 
 
 def temporal_bilateral_stabilize(
@@ -281,20 +308,20 @@ def temporal_bilateral_stabilize(
     bwd_flows: torch.Tensor,
     occ_masks: torch.Tensor,
     strength: float,
-    sigma_r: float = 0.12,
-    max_blend: float = 0.4,
+    sigma_r: float = 0.08,
+    max_blend: float = 0.35,
 ):
     """In place: post-sampling motion-compensated bilateral temporal filter for frames (B, C, H, W) in [-1, 1].
 
-    Damps residual high-frequency pixel shimmer on non-occluded pixels where the flow-warped
-    previous frame closely agrees in color, while rejecting large differences to avoid ghosting
-    or edge blur.
+    Damps residual high-frequency pixel shimmer on non-occluded pixels where the bicubic flow-warped
+    previous frame closely agrees in color, while rejecting larger differences to avoid ghosting
+    or smearing moving grain.
     """
     inv_2sigma2 = 1.0 / (2.0 * sigma_r * sigma_r)
     size = frames.shape[-2:]
     for f in range(1, frames.shape[0]):
         flow, occ = frame_flow(bwd_flows, occ_masks, f - 1, size)
-        warped = warp_image(frames[f - 1 : f], flow)
+        warped = warp_image(frames[f - 1 : f], flow, mode="bicubic")
         curr = frames[f : f + 1]
         range_w = torch.exp(-(curr - warped).pow(2).mean(dim=1, keepdim=True) * inv_2sigma2)
         curr.lerp_(warped, max_blend * strength * occ * range_w)

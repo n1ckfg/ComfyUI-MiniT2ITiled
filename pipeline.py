@@ -425,9 +425,13 @@ class MMJiT(nn.Module):
                 parts.append(torch.full_like(conf, math.log(0.2 * w)))
             parts.append(torch.log(prev_w.clamp(min=1e-6)))
             temporal_bias = torch.cat(parts, dim=-1).to(x.dtype)
-        # Skip final high-frequency blocks so fine local textures aren't stamped across frames.
+        # Skip late blocks so fine local textures aren't stamped to static 16x16 patch coordinates across frames.
+        # When optical flow is active, stop at the midpoint so later intra-patch blocks follow pixel-space motion.
         n_blocks = len(self.double_blocks)
-        temporal_block_limit = n_blocks - min(3, n_blocks // 4)
+        if temporal_flow_grid is not None:
+            temporal_block_limit = max(1, n_blocks // 2)
+        else:
+            temporal_block_limit = n_blocks - min(3, n_blocks // 4)
         for bi, block in enumerate(self.double_blocks):
             if temporal_bias is not None and bi < temporal_block_limit:
                 x, txt = block(
@@ -604,6 +608,7 @@ class DiffusionModel(nn.Module):
     def add_global_x0(
         self,
         x0,
+        x0_cond,
         x,
         t: float,
         weight: float,
@@ -616,21 +621,30 @@ class DiffusionModel(nn.Module):
         batch_state,
         temporal_consistency: float = 0.0,
         temporal_use_anchor: bool = True,
+        tile_flow_grids=None,
     ):
-        # In place: move the low frequencies of the tiled x0 toward a prediction of the whole canvas average-pooled
-        # by factor, so the 512 tiles follow one composition instead of each composing its own. Pooling keeps the
-        # noise i.i.d. but divides its std by factor; scaling by a restores the noise level the model expects and
-        # puts the pooled canvas at the later time a * t.
+        # In place: move the low frequencies of the tiled x0 (and x0_cond when distinct) toward a prediction of
+        # the whole canvas average-pooled by factor, so the 512 tiles follow one composition instead of each
+        # composing its own. Pooling keeps the noise i.i.d. but divides its std by factor; scaling by a restores
+        # the noise level the model expects and puts the pooled canvas at the later time a * t.
         h, w = x.shape[-2] // factor * factor, x.shape[-1] // factor * factor
         a = 1.0 / (t + (1.0 - t) / factor)
         x_small = F.avg_pool2d(x[..., :h, :w], factor) * a
         t_small = torch.full((x.shape[0],), a * t, device=x.device)
-        x0_small, _ = self.tiled_x0(
+        need_cond = x0_cond is not None and x0_cond is not x0
+        x0_small, x0_small_cond = self.tiled_x0(
             x_small, t_small, cfg_scale, tiles, prepared_cond, prepared_uncond, tile_callback, batch_state,
-            temporal_consistency=temporal_consistency, temporal_use_anchor=temporal_use_anchor,
+            temporal_consistency=temporal_consistency,
+            temporal_use_anchor=temporal_use_anchor,
+            tile_flow_grids=tile_flow_grids,
+            need_cond=need_cond,
         )
+        pad = (0, x.shape[-1] - w, 0, x.shape[-2] - h)
         low = F.interpolate(x0_small - F.avg_pool2d(x0[..., :h, :w], factor), size=(h, w), mode="bilinear", align_corners=False)
-        x0.add_(F.pad(low, (0, x.shape[-1] - w, 0, x.shape[-2] - h), mode="replicate"), alpha=weight)
+        x0.add_(F.pad(low, pad, mode="replicate"), alpha=weight)
+        if need_cond:
+            low_cond = F.interpolate(x0_small_cond - F.avg_pool2d(x0_cond[..., :h, :w], factor), size=(h, w), mode="bilinear", align_corners=False)
+            x0_cond.add_(F.pad(low_cond, pad, mode="replicate"), alpha=weight)
 
     def tiled_x0_vjp(self, params, x, t, prepared_text, tiles, grad_x0):
         # Vector-Jacobian product of the blended conditional x0 prediction w.r.t. x, one tile and frame at a time
@@ -686,14 +700,21 @@ class DiffusionModel(nn.Module):
         tc_strength = min(max(float(temporal_consistency), 0.0), 1.0)
         global_strength = min(max(float(global_structure), 0.0), 1.0)
         bwd_flows = occ_masks = None
-        if image is not None and b > 1 and flow_strength > 0.0:
+        if image is not None and image.shape[0] > 1 and b > 1 and flow_strength > 0.0:
+            if image.shape[0] != b:
+                raise ValueError(f"Image batch size {image.shape[0]} does not match prompt batch size {b}")
             bwd_flows, occ_masks = compute_optical_flow(image)
+        elif image is not None and image.shape[0] not in (1, b):
+            raise ValueError(f"Image batch size {image.shape[0]} does not match prompt batch size {b}")
 
         def randn(n):
             return torch.randn(n, channels, height, width, generator=generator).to(device)
 
-        if b > 1 and shared > 0.0 and bwd_flows is not None:
-            x = warp_noise_sequence(b, channels, height, width, bwd_flows, occ_masks, shared, device, torch.float32, generator=generator)
+        if b > 1 and bwd_flows is not None:
+            x = warp_noise_sequence(
+                b, channels, height, width, bwd_flows, occ_masks,
+                max(shared, flow_strength), device, torch.float32, generator=generator,
+            )
         elif b > 1 and shared > 0.0:
             x = randn(1).expand(b, -1, -1, -1)
             if shared < 1.0:
@@ -712,9 +733,14 @@ class DiffusionModel(nn.Module):
         # first half of sampling and fading out by global_end. Ending it earlier lets tiles add their own subjects.
         global_factor = min(height, width) // size
         global_end = 0.9
-        global_tiles = None
+        global_tiles = global_flow_grids = None
         if global_strength > 0.0 and global_factor >= 2:
-            global_tiles = self.tile_weights(height // global_factor, width // global_factor, tile_overlap, device)
+            gh, gw = height // global_factor, width // global_factor
+            global_tiles = self.tile_weights(gh, gw, tile_overlap, device)
+            if bwd_flows is not None and tc_strength > 0.0:
+                global_flow_grids = build_tile_flow_grids(
+                    bwd_flows / global_factor, occ_masks, (gh, gw), global_tiles, size, self.cfg.patch_size
+                )
         tile_callback = None
         if callback is not None:
             total = n_T * len(tiles)
@@ -745,15 +771,18 @@ class DiffusionModel(nn.Module):
             t_cur = t_start + (1.0 - t_start) * i / n_T
             t_next = t_start + (1.0 - t_start) * (i + 1) / n_T
             step_progress = i / n_T
-            # Cosine-taper cross-frame attention to 0 by 70% progress and drop unwarped anchor after 40%
-            # so fine textures don't stick to frame 0's screen coordinates.
-            if tc_strength > 0.0 and step_progress < 0.70:
-                step_tc = tc_strength * 0.5 * (1.0 + math.cos(math.pi * step_progress / 0.70))
-                step_use_anchor = step_progress < 0.40
+            # Cosine-taper cross-frame attention so fine textures don't lock to 16x16 patch coordinates.
+            # When optical flow is active, omit the unwarped frame-0 anchor and finish by 45% progress
+            # so cross-frame attention aligns global color/style while pixel-space transport carries motion.
+            tc_end = 0.45 if bwd_flows is not None else 0.70
+            if tc_strength > 0.0 and step_progress < tc_end:
+                step_tc = tc_strength * 0.5 * (1.0 + math.cos(math.pi * step_progress / tc_end))
+                step_use_anchor = bwd_flows is None and step_progress < 0.40
             else:
                 step_tc = 0.0
                 step_use_anchor = False
             step_flow_grids = tile_flow_grids if step_tc > 0.0 else None
+            step_global_flow_grids = global_flow_grids if step_tc > 0.0 else None
             step_uncond = uncond_prepared if self.cfg.cfg_interval[0] <= t_cur <= self.cfg.cfg_interval[1] else None
             need_guide = guide is not None and guide.active(step_progress)
             t_vec = torch.full((b,), t_cur, device=device)
@@ -768,10 +797,11 @@ class DiffusionModel(nn.Module):
                 fade = max(step_progress - 0.5, 0.0) / (global_end - 0.5)
                 weight = global_strength * 0.5 * (1.0 + math.cos(math.pi * fade))
                 self.add_global_x0(
-                    x0, x, t_cur, weight, global_factor, global_tiles, cfg_scale, cond_prepared, step_uncond,
+                    x0, x0_cond, x, t_cur, weight, global_factor, global_tiles, cfg_scale, cond_prepared, step_uncond,
                     tile_callback, batch_state,
                     temporal_consistency=step_tc,
                     temporal_use_anchor=step_use_anchor,
+                    tile_flow_grids=step_global_flow_grids,
                 )
             if need_guide:
                 vjp = lambda grad_x0: self.tiled_x0_vjp(params, x, t_vec, vjp_prepared, tiles, grad_x0)

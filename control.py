@@ -48,33 +48,52 @@ def downscale(x, factor):
     return blur(x, factor / 2)[..., ::factor, ::factor]
 
 
+def _iter_image_chunks(img: torch.Tensor, device: torch.device, chunk_size: int = 4):
+    for i in range(0, img.shape[0], chunk_size):
+        yield img[i : i + chunk_size, ..., :3].movedim(-1, 1).to(device, torch.float32)
+
+
 class EdgeControl:
-    # target: control map in [0, 1], white edges on black, (B, C, H, W) at canvas size.
+    # control["image"]: control map in [0, 1], white edges on black, (B, H, W, C).
     # Edges are compared at reduced resolution so the gradient moves shapes instead of drawing lines.
     factor = 4
     sigma = 1.5
 
-    def __init__(self, control, target):
+    def __init__(self, control, height, width, device):
         self.strength, self.start, self.end = control["strength"], control["start"], control["end"]
-        self.target = blur(downscale(gray(target), self.factor), self.sigma)
+        parts = []
+        for chunk in _iter_image_chunks(control["image"], device):
+            g = gray(chunk)
+            if g.shape[-2:] != (height, width):
+                g = F.interpolate(g, size=(height, width), mode="bilinear", antialias=True)
+            parts.append(blur(downscale(g, self.factor), self.sigma))
+        self.target = torch.cat(parts, dim=0)
 
-    def loss(self, x):
-        return -correlation(blur(sobel(downscale(gray(x * 0.5 + 0.5), self.factor)), self.sigma), self.target)
+    def loss(self, x, target=None):
+        return -correlation(
+            blur(sobel(downscale(gray(x * 0.5 + 0.5), self.factor)), self.sigma),
+            self.target if target is None else target,
+        )
 
 
 class DepthControl:
-    # target: depth map in [0, 1], near = white. Depth Anything 3 estimates depth from the x0 prediction;
+    # control["image"]: depth map in [0, 1], near = white. Depth Anything 3 estimates depth from the x0 prediction;
     # correlation makes the match independent of the target's depth scale and offset.
-    def __init__(self, control, target):
+    def __init__(self, control, height, width, device, build_target: bool = True):
         self.strength, self.start, self.end = control["strength"], control["start"], control["end"]
         self.net = control["depth_model"].model.diffusion_model
         self.dtype = self.net.dtype or torch.float32
         # ComfyUI loads weights under inference_mode, which autograd can't save; clone for this call only.
         self.params = {k: p.clone() for k, p in itertools.chain(self.net.named_parameters(), self.net.named_buffers())}
-        self.size = compute_target_size(target.shape[-2], target.shape[-1], 504)
-        self.target = F.interpolate(gray(target), size=self.size, mode="bilinear", antialias=True)
-        self.mean = torch.tensor(IMAGENET_MEAN, device=target.device).view(1, 3, 1, 1)
-        self.std = torch.tensor(IMAGENET_STD, device=target.device).view(1, 3, 1, 1)
+        self.size = compute_target_size(height, width, 504)
+        self.mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+        if build_target:
+            parts = [
+                F.interpolate(gray(chunk), size=self.size, mode="bilinear", antialias=True)
+                for chunk in _iter_image_chunks(control["image"], device)
+            ]
+            self.target = torch.cat(parts, dim=0)
 
     def depth(self, x):
         x = (x * 0.5 + 0.5).clamp(0, 1)
@@ -84,20 +103,25 @@ class DepthControl:
         x = (F.interpolate(x, size=self.size, mode="bilinear") - self.mean) / self.std
         return functional_call(self.net, self.params, (x.to(self.dtype),))["depth"].float()
 
-    def loss(self, x):
-        return -correlation(-self.depth(x), self.target)
+    def loss(self, x, target=None):
+        return -correlation(-self.depth(x), self.target if target is None else target)
 
 
 class NormalControl(DepthControl):
-    # target: normal map in the ControlNet/BAE convention, R = facing left, G = facing up, B = facing the viewer.
+    # control["image"]: normal map in the ControlNet/BAE convention, R = facing left, G = facing up, B = facing the viewer.
     # Compares those with the slopes of the estimated depth, which carries the same orientation up to scale.
-    def __init__(self, control, target):
-        super().__init__(control, target)
-        self.target = blur(F.interpolate(target[:, :2], size=self.size, mode="bilinear", antialias=True) * 2 - 1, 2.0)
+    def __init__(self, control, height, width, device):
+        super().__init__(control, height, width, device, build_target=False)
+        parts = [
+            blur(F.interpolate(chunk[:, :2], size=self.size, mode="bilinear", antialias=True) * 2 - 1, 2.0)
+            for chunk in _iter_image_chunks(control["image"], device)
+        ]
+        self.target = torch.cat(parts, dim=0)
 
-    def loss(self, x):
+    def loss(self, x, target=None):
+        t = self.target if target is None else target
         slope_x, slope_y = sobel_xy(blur(-self.depth(x).unsqueeze(1), 2.0))
-        return -(correlation(slope_x, self.target[:, :1]) + correlation(slope_y, self.target[:, 1:])) / 2
+        return -(correlation(slope_x, t[:, :1]) + correlation(slope_y, t[:, 1:])) / 2
 
 
 CONTROL_TYPES = {"edge": EdgeControl, "depth": DepthControl, "normal": NormalControl}
@@ -115,25 +139,26 @@ class Guide:
     # including for the targets that the losses save for backward.
     def __init__(self, controls, height, width, device):
         with torch.inference_mode(False):
-            self.controls = []
-            for c in controls:
-                target = c["image"][..., :3].movedim(-1, 1).to(device, torch.float32)
-                if target.shape[-2:] != (height, width):
-                    target = F.interpolate(target, size=(height, width), mode="bilinear", antialias=True)
-                self.controls.append(CONTROL_TYPES[c["type"]](c, target))
+            self.controls = [CONTROL_TYPES[c["type"]](c, height, width, device) for c in controls]
 
     # progress is the sampling progress in [0, 1), so start/end mean the same at every denoise.
     def active(self, progress):
         return any(c.start <= progress <= c.end for c in self.controls)
 
     def correction(self, x0, progress, vjp):
+        active = [c for c in self.controls if c.start <= progress <= c.end]
+        b = x0.shape[0]
+        for c in active:
+            if c.target.shape[0] not in (1, b):
+                raise ValueError(f"Control target batch size {c.target.shape[0]} does not match batch size {b}")
         with torch.inference_mode(False), torch.enable_grad():
-            x = x0.detach().clone().float().requires_grad_(True)
-            grad_x0 = torch.zeros_like(x)
-            for c in self.controls:
-                if c.start <= progress <= c.end:
-                    grad, = torch.autograd.grad(c.loss(x).sum(), x)
-                    grad_x0 += c.strength * grad / rms(grad)
+            grad_x0 = torch.zeros_like(x0, dtype=torch.float32)
+            for f in range(b):
+                xf = x0[f : f + 1].detach().clone().float().requires_grad_(True)
+                for c in active:
+                    tf = c.target if c.target.shape[0] == 1 else c.target[f : f + 1]
+                    grad, = torch.autograd.grad(c.loss(xf, tf).sum(), xf)
+                    grad_x0[f : f + 1] += c.strength * grad / rms(grad)
             grad_xt = vjp(grad_x0.to(x0.dtype)).float()
             grad_xt = grad_xt.mean(1, keepdim=True)  # same change on every channel: move brightness, not hue
             return (grad_xt * (rms(grad_x0) / rms(grad_xt))).to(x0.dtype)
